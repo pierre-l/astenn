@@ -308,25 +308,30 @@ impl<K: Eq, V> HashMapInner<K, V> {
         self.buckets.push(Bucket::new(new_depth));
         self.buckets[bucket_pool_idx].local_depth = new_depth;
 
-        // Collect entries from the old bucket into a temporary buffer.
-        // At most BUCKET_CAPACITY entries (~8), so the Vec is small.
+        // Collect entries from the old bucket into a stack-allocated buffer.
+        // No heap allocation — BUCKET_CAPACITY is small (8).
         let bit = 1u64 << old_depth;
         let n = self.buckets[bucket_pool_idx].len();
-        let mut old_entries: Vec<(u64, K, V)> = Vec::with_capacity(n);
+        let mut hashes_buf = [0u64; BUCKET_CAPACITY];
+        let mut entries_buf: [MaybeUninit<(K, V)>; BUCKET_CAPACITY] =
+            [const { MaybeUninit::uninit() }; BUCKET_CAPACITY];
         for i in 0..n {
-            let hash = self.buckets[bucket_pool_idx].hashes[i];
+            hashes_buf[i] = self.buckets[bucket_pool_idx].hashes[i];
             // SAFETY: `i < len`, so `entries[i]` is initialized. `assume_init_read`
             // copies the value; we reset `len = 0` below so the bucket won't
             // double-drop.
-            let (key, value) =
-                unsafe { self.buckets[bucket_pool_idx].entries[i].assume_init_read() };
-            old_entries.push((hash, key, value));
+            entries_buf[i]
+                .write(unsafe { self.buckets[bucket_pool_idx].entries[i].assume_init_read() });
         }
         self.buckets[bucket_pool_idx].len = 0;
 
         // Redistribute entries based on the distinguishing bit at position
         // `old_depth` (0-indexed from LSB).
-        for (hash, key, value) in old_entries {
+        for i in 0..n {
+            let hash = hashes_buf[i];
+            // SAFETY: `entries_buf[i]` was initialized in the loop above for
+            // all `i < n`.
+            let (key, value) = unsafe { entries_buf[i].assume_init_read() };
             if hash & bit != 0 {
                 self.buckets[new_bucket_idx].push(hash, key, value);
             } else {
@@ -439,7 +444,13 @@ impl<K, V, S> HashMap<K, V, S> {
         let global_depth = num_buckets.trailing_zeros() as u8;
         let dir_size = 1usize << global_depth;
 
-        let mut buckets = Vec::with_capacity(dir_size);
+        // Reserve 2× the initial bucket count. Under uniform hashing, each
+        // initial bucket splits roughly once as the map fills to capacity,
+        // doubling the bucket count. Pre-allocating avoids a Vec reallocation
+        // that would memcpy ALL bucket data (~384 bytes per bucket with
+        // align(64)), which would defeat the "only touch one bucket per
+        // split" latency guarantee.
+        let mut buckets = Vec::with_capacity(dir_size.saturating_mul(2).max(1));
         let mut directory: Vec<u32> = Vec::with_capacity(dir_size);
         for i in 0..dir_size {
             buckets.push(Bucket::new(global_depth));
