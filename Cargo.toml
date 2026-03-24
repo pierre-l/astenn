@@ -1,0 +1,5 @@
+[package]
+name = "astenn"
+version = "0.1.0"
+edition = "2024"
+description = "Extendible hashing HashMap for Rust"
