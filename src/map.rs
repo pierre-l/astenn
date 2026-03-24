@@ -120,18 +120,28 @@ impl<K: Eq, V> HashMapInner<K, V> {
     /// sibling bucket, and redistribute entries based on the next hash bit.
     /// Only the overflowing bucket is touched — all other buckets remain
     /// undisturbed. This is the key latency advantage over full-table rehash.
+    ///
+    /// Cost breakdown:
+    /// - Directory doubling (when needed): O(directory_size) memcpy
+    /// - Entry redistribution: O(BUCKET_CAPACITY)
+    /// - Directory pointer update: O(2^(global_depth - local_depth)),
+    ///   i.e. proportional to the number of directory slots aliasing this
+    ///   bucket, NOT the full directory size.
     fn split_bucket(&mut self, bucket_pool_idx: usize) {
         let old_depth = self.buckets[bucket_pool_idx].local_depth;
         let new_depth = old_depth + 1;
 
+        // Capture the hash prefix before any structural changes. The low
+        // `old_depth` bits of any entry's hash identify which directory
+        // slots map to this bucket — we use this to target the update.
+        let base_pattern = self.buckets[bucket_pool_idx].entries[0].0 as usize
+            & ((1usize << old_depth).wrapping_sub(1));
+
         // Double the directory if the bucket's new depth exceeds global depth.
+        // `extend_from_within` compiles to a single memcpy.
         if new_depth > self.global_depth {
             let old_size = self.directory.len();
-            self.directory.reserve(old_size);
-            for i in 0..old_size {
-                let v = self.directory[i];
-                self.directory.push(v);
-            }
+            self.directory.extend_from_within(0..old_size);
             self.global_depth += 1;
         }
 
@@ -146,8 +156,15 @@ impl<K: Eq, V> HashMapInner<K, V> {
         // Redistribute entries. The distinguishing bit is at position
         // `old_depth` (0-indexed from the LSB). Entries whose hash has this
         // bit set move to the new bucket; the rest stay.
+        //
+        // `mem::replace` with a pre-allocated Vec avoids a reallocation when
+        // pushing entries back into the old bucket (plain `mem::take` would
+        // leave a zero-capacity Vec).
         let bit = 1u64 << old_depth;
-        let entries = std::mem::take(&mut self.buckets[bucket_pool_idx].entries);
+        let entries = std::mem::replace(
+            &mut self.buckets[bucket_pool_idx].entries,
+            Vec::with_capacity(BUCKET_CAPACITY),
+        );
         for entry in entries {
             if entry.0 & bit != 0 {
                 self.buckets[new_bucket_pool_idx].entries.push(entry);
@@ -156,12 +173,23 @@ impl<K: Eq, V> HashMapInner<K, V> {
             }
         }
 
-        // Update directory: every slot that pointed to the old bucket and has
-        // the distinguishing bit set now points to the sibling.
-        for slot in 0..self.directory.len() {
-            if self.directory[slot] == bucket_pool_idx && (slot as u64 & bit) != 0 {
-                self.directory[slot] = new_bucket_pool_idx;
-            }
+        // Targeted directory update: only visit slots that pointed to the
+        // old bucket AND have the distinguishing bit set (these move to the
+        // sibling). The affected slots start at `base_pattern | bit` and
+        // repeat every `1 << new_depth` entries — touching exactly
+        // 2^(global_depth - new_depth) slots instead of the full directory.
+        let new_start = base_pattern | bit as usize;
+        let step = 1usize << new_depth;
+        let dir_size = self.directory.len();
+        let mut slot = new_start;
+        while slot < dir_size {
+            debug_assert_eq!(
+                self.directory[slot], bucket_pool_idx,
+                "directory slot {slot} should point to bucket {bucket_pool_idx} but points to {}",
+                self.directory[slot]
+            );
+            self.directory[slot] = new_bucket_pool_idx;
+            slot += step;
         }
     }
 }
@@ -1086,5 +1114,201 @@ mod tests {
             *v += 1;
         }
         assert_eq!(map[&1], 11);
+    }
+
+    // -----------------------------------------------------------------------
+    // Identity hasher — deterministic control over hash bit patterns
+    // -----------------------------------------------------------------------
+
+    /// Hasher that returns the bytes written as-is. For u64 keys this is the
+    /// identity function, giving us full control over which directory slot
+    /// and bucket each key maps to.
+    struct IdentityHasher(u64);
+
+    impl std::hash::Hasher for IdentityHasher {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            // Fold bytes into u64 little-endian (sufficient for test keys).
+            self.0 = 0;
+            for (i, &b) in bytes.iter().enumerate().take(8) {
+                self.0 |= (b as u64) << (i * 8);
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct IdentityBuildHasher;
+
+    impl std::hash::BuildHasher for IdentityBuildHasher {
+        type Hasher = IdentityHasher;
+        fn build_hasher(&self) -> IdentityHasher {
+            IdentityHasher(0)
+        }
+    }
+
+    /// Helper: create a map with the identity hasher.
+    fn identity_map() -> HashMap<u64, u64, IdentityBuildHasher> {
+        HashMap::with_hasher(IdentityBuildHasher)
+    }
+
+    #[test]
+    fn split_distributes_by_next_bit() {
+        // Start with global_depth=0 (1 bucket). Insert 9 keys to force a
+        // split. Keys 0..8 have bit 0 = 0, key 1 has bit 0 = 1. After the
+        // split on bit 0, key 1 should be alone in the sibling bucket.
+        let mut map = identity_map();
+
+        // 8 even-numbered keys → all have bit 0 = 0, land in the same bucket.
+        for i in 0u64..8 {
+            map.insert(i * 2, i);
+        }
+        assert_eq!(map.inner.global_depth, 0); // still one bucket, 8 entries
+
+        // 9th insert (odd key) forces a split on bit 0.
+        map.insert(1, 100);
+        assert!(map.inner.global_depth >= 1);
+        assert_eq!(map.len(), 9);
+        assert_eq!(map[&1], 100);
+        for i in 0u64..8 {
+            assert_eq!(map[&(i * 2)], i);
+        }
+    }
+
+    #[test]
+    fn split_directory_pointers_correct() {
+        // Force multiple splits and verify every key is still reachable.
+        // Keys are chosen to exercise different bit patterns.
+        let mut map = identity_map();
+
+        // Insert keys with hashes 0, 1, 2, ..., 63. Each set of 8 keys
+        // sharing the same low bits will fill a bucket and force a split.
+        for i in 0u64..64 {
+            map.insert(i, i * 7);
+        }
+        assert_eq!(map.len(), 64);
+        for i in 0u64..64 {
+            assert_eq!(map.get(&i), Some(&(i * 7)), "missing key {i}");
+        }
+
+        // Verify directory size is a power of two and consistent with
+        // global_depth.
+        assert_eq!(map.inner.directory.len(), 1 << map.inner.global_depth);
+
+        // Verify every directory slot points to a valid bucket and that
+        // bucket's local_depth <= global_depth.
+        for &bi in &map.inner.directory {
+            assert!(bi < map.inner.buckets.len());
+            assert!(map.inner.buckets[bi].local_depth <= map.inner.global_depth);
+        }
+    }
+
+    #[test]
+    fn split_all_same_low_bits_forces_repeated_splits() {
+        // All keys have the same low 3 bits (= 0b101 = 5). This forces the
+        // first 3 splits to produce empty siblings (all entries stay in the
+        // same bucket), driving local_depth up without distributing entries.
+        // Bit 3 finally differs and entries split.
+        let mut map = identity_map();
+
+        // Keys: 5, 5+8=13, 5+16=21, ..., 5+56=61 (8 keys, all ≡ 5 mod 8)
+        // Plus 5+4=9 which differs at bit 3 (binary: 5=0101, 9=1001, diff at bit 3).
+        // Wait, 5=0b0101, 13=0b1101. Bit 3 of 5=0, bit 3 of 13=1. So the
+        // first split (on bit 0) separates nothing (all have bit 0 = 1).
+        // Actually: 5=0b101. All keys ≡ 5 mod 8 means bits 0-2 are 101.
+        // Splits on bits 0, 1, 2 produce empty siblings. Split on bit 3
+        // finally separates keys where bit 3 = 0 (e.g. 5=0b0101) from
+        // keys where bit 3 = 1 (e.g. 13=0b1101).
+        let keys: Vec<u64> = (0..9).map(|i| 5 + i * 8).collect();
+        // keys = [5, 13, 21, 29, 37, 45, 53, 61, 69]
+        // bit 3: 5=0,13=1,21=0,29=1,37=0,45=1,53=0,61=1,69=0
+
+        for &k in &keys {
+            map.insert(k, k);
+        }
+        assert_eq!(map.len(), 9);
+        for &k in &keys {
+            assert_eq!(map[&k], k);
+        }
+    }
+
+    #[test]
+    fn targeted_directory_update_with_deep_split() {
+        // Build a map where one bucket has low local_depth while others are
+        // deeper. Insert keys to force global_depth high, then insert into the
+        // lagging bucket to trigger a split that must update multiple
+        // directory slots via the targeted (non-scanning) path.
+        let mut map = identity_map();
+
+        // Phase 1: insert 64 keys (0..63) to build up the directory.
+        for i in 0u64..64 {
+            map.insert(i, i);
+        }
+        let gd_after_phase1 = map.inner.global_depth;
+
+        // Phase 2: insert 200 more keys in a range that exercises further
+        // splits. After this, global_depth should be well above the
+        // local_depth of some buckets.
+        for i in 64u64..264 {
+            map.insert(i, i);
+        }
+        assert_eq!(map.len(), 264);
+
+        // Verify all keys are retrievable (the core correctness check).
+        for i in 0u64..264 {
+            assert_eq!(
+                map.get(&i),
+                Some(&i),
+                "missing key {i} (gd was {gd_after_phase1}, now {})",
+                map.inner.global_depth
+            );
+        }
+
+        // Verify structural invariants.
+        let dir_size = map.inner.directory.len();
+        assert_eq!(dir_size, 1 << map.inner.global_depth);
+        for slot in 0..dir_size {
+            let bi = map.inner.directory[slot];
+            assert!(
+                bi < map.inner.buckets.len(),
+                "slot {slot} → invalid bucket {bi}"
+            );
+            let bucket = &map.inner.buckets[bi];
+            assert!(
+                bucket.local_depth <= map.inner.global_depth,
+                "bucket {bi} local_depth {} > global_depth {}",
+                bucket.local_depth,
+                map.inner.global_depth
+            );
+            // Every entry in this bucket should hash to this directory slot
+            // (modulo the bucket's local_depth mask).
+            let local_mask = (1usize << bucket.local_depth) - 1;
+            for &(hash, _, _) in &bucket.entries {
+                assert_eq!(
+                    hash as usize & local_mask,
+                    slot & local_mask,
+                    "entry with hash {hash:#x} in bucket {bi} (slot {slot}) violates local_depth {} prefix",
+                    bucket.local_depth
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_entries_counted_once_via_bucket_pool() {
+        // Verify that iterating the bucket pool visits each entry exactly
+        // once, even with aliased directory entries.
+        let mut map = identity_map();
+        for i in 0u64..500 {
+            map.insert(i, i);
+        }
+        let iter_count = map.iter().count();
+        assert_eq!(iter_count, 500);
+        assert_eq!(iter_count, map.len());
+
+        // Verify via bucket pool directly.
+        let pool_count: usize = map.inner.buckets.iter().map(|b| b.entries.len()).sum();
+        assert_eq!(pool_count, 500);
     }
 }
