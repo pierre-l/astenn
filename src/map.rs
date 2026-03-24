@@ -27,34 +27,36 @@ const MAX_LOCAL_DEPTH: u8 = 64;
 /// (not heap-allocated) for cache locality: the hash array and key-value array
 /// are contiguous in memory with the bucket metadata.
 ///
-/// Layout is struct-of-arrays within the bucket: hashes are stored in a
-/// separate array from key-value pairs. A lookup scans only the 64-byte hash
-/// array (one cache line) before touching any keys or values, so the common
-/// case (no match) never reads beyond one cache line of entry data.
+/// `repr(C, align(64))` guarantees the hash array starts at offset 0 — the
+/// beginning of a cache line. A lookup scans only this 64-byte array (one
+/// cache line) before touching any keys or values, so the common case (no
+/// match) never reads beyond one cache line of entry data.
 ///
 /// Multiple directory slots may point to the same bucket when
 /// `local_depth < global_depth`.
+#[repr(C, align(64))]
 pub(crate) struct Bucket<K, V> {
-    pub(crate) local_depth: u8,
-    /// Number of initialized entries in `hashes` and `entries`. Invariant:
-    /// `len <= BUCKET_CAPACITY`.
-    pub(crate) len: u8,
-    /// Hash values, indexed `0..len`. Stored separately for cache-friendly
-    /// scanning during lookup (8 × u64 = 64 bytes = exactly one cache line).
+    /// Hash values, indexed `0..len`. **First field** so it sits at the
+    /// cache-line-aligned start of the struct. 8 × u64 = 64 bytes = exactly
+    /// one cache line — the lookup hot path reads only this line.
     pub(crate) hashes: [u64; BUCKET_CAPACITY],
     /// Key-value pairs, indexed `0..len`. Only `entries[0..len]` are
     /// initialized; the rest are `MaybeUninit`.
     pub(crate) entries: [MaybeUninit<(K, V)>; BUCKET_CAPACITY],
+    pub(crate) local_depth: u8,
+    /// Number of initialized entries in `hashes` and `entries`. Invariant:
+    /// `len <= BUCKET_CAPACITY`.
+    pub(crate) len: u8,
 }
 
 impl<K, V> Bucket<K, V> {
     fn new(local_depth: u8) -> Self {
         Self {
-            local_depth,
-            len: 0,
             hashes: [0; BUCKET_CAPACITY],
             // SAFETY: An array of MaybeUninit doesn't require initialization.
             entries: [const { MaybeUninit::uninit() }; BUCKET_CAPACITY],
+            local_depth,
+            len: 0,
         }
     }
 
@@ -167,9 +169,11 @@ impl<K: Clone, V: Clone> Clone for Bucket<K, V> {
 /// `S` type parameter (matching the `std::collections::HashMap` entry API).
 pub(crate) struct HashMapInner<K, V> {
     /// Directory of bucket indices. Length is always `2^global_depth`.
-    /// Multiple slots may map to the same bucket index when a bucket's
-    /// `local_depth < global_depth`.
-    pub(crate) directory: Vec<usize>,
+    /// `u32` instead of `usize` halves the directory footprint (e.g. a
+    /// 32K-entry directory drops from 256 KB to 128 KB), keeping it
+    /// tighter in L2 cache. Max 4 billion buckets is far beyond any
+    /// realistic workload.
+    pub(crate) directory: Vec<u32>,
 
     /// Pool of buckets. Each bucket appears exactly once; the directory
     /// references buckets by their index in this vec. Buckets are never
@@ -204,7 +208,7 @@ impl<K: Eq, V> HashMapInner<K, V> {
         Q: Eq + ?Sized,
     {
         let dir_idx = self.dir_index(hash);
-        let bucket_idx = self.directory[dir_idx];
+        let bucket_idx = self.directory[dir_idx] as usize;
         let bucket = &self.buckets[bucket_idx];
         for i in 0..bucket.len() {
             if bucket.hashes[i] == hash {
@@ -224,7 +228,7 @@ impl<K: Eq, V> HashMapInner<K, V> {
     pub(crate) fn insert_entry(&mut self, hash: u64, key: K, value: V) -> (usize, usize) {
         loop {
             let dir_idx = self.dir_index(hash);
-            let bucket_pool_idx = self.directory[dir_idx];
+            let bucket_pool_idx = self.directory[dir_idx] as usize;
 
             if self.buckets[bucket_pool_idx].len() < BUCKET_CAPACITY
                 || self.buckets[bucket_pool_idx].local_depth >= MAX_LOCAL_DEPTH
@@ -250,6 +254,7 @@ impl<K: Eq, V> HashMapInner<K, V> {
     /// - Directory pointer update: O(2^(global_depth - local_depth)),
     ///   i.e. proportional to the number of directory slots aliasing this
     ///   bucket, NOT the full directory size.
+    #[cold]
     fn split_bucket(&mut self, bucket_pool_idx: usize) {
         let old_depth = self.buckets[bucket_pool_idx].local_depth;
         let new_depth = old_depth + 1;
@@ -269,7 +274,7 @@ impl<K: Eq, V> HashMapInner<K, V> {
         }
 
         // Create the sibling bucket.
-        let new_bucket_pool_idx = self.buckets.len();
+        let new_bucket_idx = self.buckets.len();
         self.buckets.push(Bucket::new(new_depth));
         self.buckets[bucket_pool_idx].local_depth = new_depth;
 
@@ -293,7 +298,7 @@ impl<K: Eq, V> HashMapInner<K, V> {
         // `old_depth` (0-indexed from LSB).
         for (hash, key, value) in old_entries {
             if hash & bit != 0 {
-                self.buckets[new_bucket_pool_idx].push(hash, key, value);
+                self.buckets[new_bucket_idx].push(hash, key, value);
             } else {
                 self.buckets[bucket_pool_idx].push(hash, key, value);
             }
@@ -307,14 +312,16 @@ impl<K: Eq, V> HashMapInner<K, V> {
         let new_start = base_pattern | bit as usize;
         let step = 1usize << new_depth;
         let dir_size = self.directory.len();
+        let bucket_pool_idx_u32 = bucket_pool_idx as u32;
+        let new_bucket_idx_u32 = new_bucket_idx as u32;
         let mut slot = new_start;
         while slot < dir_size {
             debug_assert_eq!(
-                self.directory[slot], bucket_pool_idx,
+                self.directory[slot], bucket_pool_idx_u32,
                 "directory slot {slot} should point to bucket {bucket_pool_idx} but points to {}",
                 self.directory[slot]
             );
-            self.directory[slot] = new_bucket_pool_idx;
+            self.directory[slot] = new_bucket_idx_u32;
             slot += step;
         }
     }
@@ -402,10 +409,10 @@ impl<K, V, S> HashMap<K, V, S> {
         let dir_size = 1usize << global_depth;
 
         let mut buckets = Vec::with_capacity(dir_size);
-        let mut directory = Vec::with_capacity(dir_size);
+        let mut directory: Vec<u32> = Vec::with_capacity(dir_size);
         for i in 0..dir_size {
             buckets.push(Bucket::new(global_depth));
-            directory.push(i);
+            directory.push(i as u32);
         }
 
         Self {
@@ -1342,6 +1349,7 @@ mod tests {
         // Verify every directory slot points to a valid bucket and that
         // bucket's local_depth <= global_depth.
         for &bi in &map.inner.directory {
+            let bi = bi as usize;
             assert!(bi < map.inner.buckets.len());
             assert!(map.inner.buckets[bi].local_depth <= map.inner.global_depth);
         }
@@ -1412,7 +1420,7 @@ mod tests {
         let dir_size = map.inner.directory.len();
         assert_eq!(dir_size, 1 << map.inner.global_depth);
         for slot in 0..dir_size {
-            let bi = map.inner.directory[slot];
+            let bi = map.inner.directory[slot] as usize;
             assert!(
                 bi < map.inner.buckets.len(),
                 "slot {slot} → invalid bucket {bi}"
