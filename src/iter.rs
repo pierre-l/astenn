@@ -7,7 +7,7 @@ use crate::map::Bucket;
 /// An iterator over the entries of a `HashMap`.
 pub struct Iter<'a, K, V> {
     buckets: std::slice::Iter<'a, Bucket<K, V>>,
-    current: std::slice::Iter<'a, (u64, K, V)>,
+    current: std::slice::Iter<'a, (K, V)>,
 }
 
 impl<'a, K, V> Iter<'a, K, V> {
@@ -25,17 +25,15 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some((_, k, v)) = self.current.next() {
+            if let Some((k, v)) = self.current.next() {
                 return Some((k, v));
             }
             let bucket = self.buckets.next()?;
-            self.current = bucket.entries.iter();
+            self.current = bucket.entries_slice().iter();
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        // Lower bound: entries remaining in current bucket slice.
-        // Upper bound: unknown without summing all buckets.
         let remaining_current = self.current.len();
         (remaining_current, None)
     }
@@ -48,7 +46,7 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
 /// A mutable iterator over the entries of a `HashMap`.
 pub struct IterMut<'a, K, V> {
     buckets: std::slice::IterMut<'a, Bucket<K, V>>,
-    current: std::slice::IterMut<'a, (u64, K, V)>,
+    current: std::slice::IterMut<'a, (K, V)>,
 }
 
 impl<'a, K, V> IterMut<'a, K, V> {
@@ -66,11 +64,12 @@ impl<'a, K, V> Iterator for IterMut<'a, K, V> {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some((_, k, v)) = self.current.next() {
-                return Some((k, v));
+            if let Some((k, v)) = self.current.next() {
+                // Reborrow to split into shared key ref and exclusive value ref.
+                return Some((&*k, v));
             }
             let bucket = self.buckets.next()?;
-            self.current = bucket.entries.iter_mut();
+            self.current = bucket.entries_slice_mut().iter_mut();
         }
     }
 }
@@ -79,17 +78,28 @@ impl<'a, K, V> Iterator for IterMut<'a, K, V> {
 // IntoIter — consuming iterator over (K, V)
 // ---------------------------------------------------------------------------
 
-/// An owning iterator over the entries of a `HashMap`.
+/// An owning iterator over the entries of a `HashMap`. Constructed by
+/// consuming the map; entries are collected eagerly from the inline
+/// bucket storage.
 pub struct IntoIter<K, V> {
-    buckets: std::vec::IntoIter<Bucket<K, V>>,
-    current: std::vec::IntoIter<(u64, K, V)>,
+    iter: std::vec::IntoIter<(K, V)>,
 }
 
 impl<K, V> IntoIter<K, V> {
-    pub(crate) fn new(buckets: Vec<Bucket<K, V>>) -> Self {
+    pub(crate) fn new(mut buckets: Vec<Bucket<K, V>>) -> Self {
+        let total: usize = buckets.iter().map(|b| b.len()).sum();
+        let mut entries = Vec::with_capacity(total);
+        for bucket in &mut buckets {
+            for i in 0..bucket.len() {
+                // SAFETY: `i < bucket.len()`, so `entries[i]` is initialized.
+                // `assume_init_read` moves the value out; we set `len = 0`
+                // after the loop so the bucket's Drop won't double-free.
+                entries.push(unsafe { bucket.entries[i].assume_init_read() });
+            }
+            bucket.len = 0;
+        }
         Self {
-            buckets: buckets.into_iter(),
-            current: Vec::new().into_iter(),
+            iter: entries.into_iter(),
         }
     }
 }
@@ -99,13 +109,11 @@ impl<K, V> Iterator for IntoIter<K, V> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if let Some((_, k, v)) = self.current.next() {
-                return Some((k, v));
-            }
-            let bucket = self.buckets.next()?;
-            self.current = bucket.entries.into_iter();
-        }
+        self.iter.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter.size_hint()
     }
 }
 

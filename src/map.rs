@@ -2,43 +2,159 @@ use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
+use std::mem::MaybeUninit;
 use std::ops::Index;
 
 use crate::entry::{Entry, OccupiedEntry, VacantEntry};
 use crate::iter::{Drain, IntoIter, Iter, IterMut, Keys, Values, ValuesMut};
 
-/// Entries per bucket before a split is attempted. 8 entries keeps buckets
-/// compact (~320 bytes for typical Melin key/value sizes) while amortising
-/// the cost of linear scan within a bucket.
+/// Entries per bucket before a split is attempted. 8 entries keeps the hash
+/// array at exactly 64 bytes (one cache line) and the total bucket size
+/// around 5 cache lines for typical Melin entry sizes.
 const BUCKET_CAPACITY: usize = 8;
 
 /// Maximum local depth — bounded by the number of usable bits in a u64 hash.
-/// Once a bucket reaches this depth, further splits are impossible (all entries
-/// share the same hash prefix) so the bucket is allowed to overflow.
+/// Once a bucket reaches this depth, further splits cannot redistribute
+/// entries. With a good hash function (FxHash, SipHash), 8+ keys sharing
+/// the same 64-bit hash is astronomically unlikely.
 const MAX_LOCAL_DEPTH: u8 = 64;
 
 // ---------------------------------------------------------------------------
-// Bucket
+// Bucket — inline storage, struct-of-arrays layout
 // ---------------------------------------------------------------------------
 
-/// A single bucket in the extendible hash table. Multiple directory slots may
-/// point to the same bucket (when `local_depth < global_depth`). Each entry
-/// stores the full 64-bit hash alongside key and value to avoid rehashing
-/// during bucket splits.
+/// A single bucket in the extendible hash table. Entries are stored **inline**
+/// (not heap-allocated) for cache locality: the hash array and key-value array
+/// are contiguous in memory with the bucket metadata.
+///
+/// Layout is struct-of-arrays within the bucket: hashes are stored in a
+/// separate array from key-value pairs. A lookup scans only the 64-byte hash
+/// array (one cache line) before touching any keys or values, so the common
+/// case (no match) never reads beyond one cache line of entry data.
+///
+/// Multiple directory slots may point to the same bucket when
+/// `local_depth < global_depth`.
 pub(crate) struct Bucket<K, V> {
     pub(crate) local_depth: u8,
-    /// Entries are `(hash, key, value)`. We store the hash to enable:
-    /// 1. Fast-reject during lookup (compare u64 before calling `Eq`)
-    /// 2. Zero-cost redistribution during bucket splits
-    pub(crate) entries: Vec<(u64, K, V)>,
+    /// Number of initialized entries in `hashes` and `entries`. Invariant:
+    /// `len <= BUCKET_CAPACITY`.
+    pub(crate) len: u8,
+    /// Hash values, indexed `0..len`. Stored separately for cache-friendly
+    /// scanning during lookup (8 × u64 = 64 bytes = exactly one cache line).
+    pub(crate) hashes: [u64; BUCKET_CAPACITY],
+    /// Key-value pairs, indexed `0..len`. Only `entries[0..len]` are
+    /// initialized; the rest are `MaybeUninit`.
+    pub(crate) entries: [MaybeUninit<(K, V)>; BUCKET_CAPACITY],
+}
+
+impl<K, V> Bucket<K, V> {
+    fn new(local_depth: u8) -> Self {
+        Self {
+            local_depth,
+            len: 0,
+            hashes: [0; BUCKET_CAPACITY],
+            // SAFETY: An array of MaybeUninit doesn't require initialization.
+            entries: [const { MaybeUninit::uninit() }; BUCKET_CAPACITY],
+        }
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    /// Push a new entry. The caller must ensure the bucket is not full
+    /// (enforced by the split-before-insert loop in `insert_entry`).
+    #[inline]
+    fn push(&mut self, hash: u64, key: K, value: V) {
+        let idx = self.len as usize;
+        debug_assert!(
+            idx < BUCKET_CAPACITY,
+            "bucket overflow at local_depth={}",
+            self.local_depth
+        );
+        self.hashes[idx] = hash;
+        self.entries[idx].write((key, value));
+        self.len += 1;
+    }
+
+    /// Remove the entry at `idx` by swapping it with the last entry.
+    /// Returns the removed `(hash, key, value)`.
+    pub(crate) fn swap_remove(&mut self, idx: usize) -> (u64, K, V) {
+        debug_assert!(idx < self.len as usize);
+        let last = (self.len - 1) as usize;
+
+        let hash = self.hashes[idx];
+        // SAFETY: `idx < len`, so `entries[idx]` is initialized. `assume_init_read`
+        // copies the value out without dropping the source (we overwrite it below
+        // or leave it as the now-uninit last slot).
+        let (key, value) = unsafe { self.entries[idx].assume_init_read() };
+
+        if idx != last {
+            self.hashes[idx] = self.hashes[last];
+            // SAFETY: `last < len` (old len), so `entries[last]` is initialized.
+            // Move it into the vacated slot; `entries[last]` becomes uninit.
+            unsafe {
+                self.entries[idx].write(self.entries[last].assume_init_read());
+            }
+        }
+
+        self.len -= 1;
+        (hash, key, value)
+    }
+
+    /// Return a slice over the initialized key-value pairs.
+    ///
+    /// # Safety
+    ///
+    /// The returned slice borrows `self` — it is only valid while
+    /// the bucket is not mutated.
+    pub(crate) fn entries_slice(&self) -> &[(K, V)] {
+        // SAFETY: `entries[0..len]` are all initialized, and `MaybeUninit<T>`
+        // has the same layout as `T`.
+        unsafe { std::slice::from_raw_parts(self.entries.as_ptr().cast(), self.len as usize) }
+    }
+
+    /// Return a mutable slice over the initialized key-value pairs.
+    pub(crate) fn entries_slice_mut(&mut self) -> &mut [(K, V)] {
+        // SAFETY: same as `entries_slice`.
+        unsafe {
+            std::slice::from_raw_parts_mut(self.entries.as_mut_ptr().cast(), self.len as usize)
+        }
+    }
+
+    /// Drop all initialized entries and reset len to 0.
+    fn clear(&mut self) {
+        for i in 0..self.len as usize {
+            // SAFETY: `i < len`, so `entries[i]` is initialized.
+            unsafe {
+                self.entries[i].assume_init_drop();
+            }
+        }
+        self.len = 0;
+    }
+}
+
+impl<K, V> Drop for Bucket<K, V> {
+    fn drop(&mut self) {
+        for i in 0..self.len as usize {
+            // SAFETY: `i < len`, so `entries[i]` is initialized.
+            unsafe {
+                self.entries[i].assume_init_drop();
+            }
+        }
+    }
 }
 
 impl<K: Clone, V: Clone> Clone for Bucket<K, V> {
     fn clone(&self) -> Self {
-        Self {
-            local_depth: self.local_depth,
-            entries: self.entries.clone(),
+        let mut new = Self::new(self.local_depth);
+        for i in 0..self.len as usize {
+            // SAFETY: `i < len`, so `entries[i]` is initialized.
+            let (k, v) = unsafe { self.entries[i].assume_init_ref() };
+            new.push(self.hashes[i], k.clone(), v.clone());
         }
+        new
     }
 }
 
@@ -77,6 +193,10 @@ impl<K, V> HashMapInner<K, V> {
 
 impl<K: Eq, V> HashMapInner<K, V> {
     /// Find `(bucket_pool_idx, entry_idx)` for a key, or `None`.
+    ///
+    /// The lookup scans the bucket's hash array first (one cache line),
+    /// then only touches the key on a hash match. This keeps the common
+    /// "not found" path fast.
     #[inline]
     fn find<Q>(&self, hash: u64, key: &Q) -> Option<(usize, usize)>
     where
@@ -86,9 +206,14 @@ impl<K: Eq, V> HashMapInner<K, V> {
         let dir_idx = self.dir_index(hash);
         let bucket_idx = self.directory[dir_idx];
         let bucket = &self.buckets[bucket_idx];
-        for (i, (h, k, _)) in bucket.entries.iter().enumerate() {
-            if *h == hash && k.borrow() == key {
-                return Some((bucket_idx, i));
+        for i in 0..bucket.len() {
+            if bucket.hashes[i] == hash {
+                // Hash match — compare the actual key.
+                // SAFETY: `i < bucket.len()`, so `entries[i]` is initialized.
+                let (k, _) = unsafe { bucket.entries[i].assume_init_ref() };
+                if k.borrow() == key {
+                    return Some((bucket_idx, i));
+                }
             }
         }
         None
@@ -101,13 +226,11 @@ impl<K: Eq, V> HashMapInner<K, V> {
             let dir_idx = self.dir_index(hash);
             let bucket_pool_idx = self.directory[dir_idx];
 
-            if self.buckets[bucket_pool_idx].entries.len() < BUCKET_CAPACITY
+            if self.buckets[bucket_pool_idx].len() < BUCKET_CAPACITY
                 || self.buckets[bucket_pool_idx].local_depth >= MAX_LOCAL_DEPTH
             {
-                let entry_idx = self.buckets[bucket_pool_idx].entries.len();
-                self.buckets[bucket_pool_idx]
-                    .entries
-                    .push((hash, key, value));
+                let entry_idx = self.buckets[bucket_pool_idx].len();
+                self.buckets[bucket_pool_idx].push(hash, key, value);
                 self.len += 1;
                 return (bucket_pool_idx, entry_idx);
             }
@@ -134,8 +257,8 @@ impl<K: Eq, V> HashMapInner<K, V> {
         // Capture the hash prefix before any structural changes. The low
         // `old_depth` bits of any entry's hash identify which directory
         // slots map to this bucket — we use this to target the update.
-        let base_pattern = self.buckets[bucket_pool_idx].entries[0].0 as usize
-            & ((1usize << old_depth).wrapping_sub(1));
+        let base_pattern =
+            self.buckets[bucket_pool_idx].hashes[0] as usize & ((1usize << old_depth) - 1);
 
         // Double the directory if the bucket's new depth exceeds global depth.
         // `extend_from_within` compiles to a single memcpy.
@@ -147,29 +270,32 @@ impl<K: Eq, V> HashMapInner<K, V> {
 
         // Create the sibling bucket.
         let new_bucket_pool_idx = self.buckets.len();
-        self.buckets.push(Bucket {
-            local_depth: new_depth,
-            entries: Vec::with_capacity(BUCKET_CAPACITY),
-        });
+        self.buckets.push(Bucket::new(new_depth));
         self.buckets[bucket_pool_idx].local_depth = new_depth;
 
-        // Redistribute entries. The distinguishing bit is at position
-        // `old_depth` (0-indexed from the LSB). Entries whose hash has this
-        // bit set move to the new bucket; the rest stay.
-        //
-        // `mem::replace` with a pre-allocated Vec avoids a reallocation when
-        // pushing entries back into the old bucket (plain `mem::take` would
-        // leave a zero-capacity Vec).
+        // Collect entries from the old bucket into a temporary buffer.
+        // At most BUCKET_CAPACITY entries (~8), so the Vec is small.
         let bit = 1u64 << old_depth;
-        let entries = std::mem::replace(
-            &mut self.buckets[bucket_pool_idx].entries,
-            Vec::with_capacity(BUCKET_CAPACITY),
-        );
-        for entry in entries {
-            if entry.0 & bit != 0 {
-                self.buckets[new_bucket_pool_idx].entries.push(entry);
+        let n = self.buckets[bucket_pool_idx].len();
+        let mut old_entries: Vec<(u64, K, V)> = Vec::with_capacity(n);
+        for i in 0..n {
+            let hash = self.buckets[bucket_pool_idx].hashes[i];
+            // SAFETY: `i < len`, so `entries[i]` is initialized. `assume_init_read`
+            // copies the value; we reset `len = 0` below so the bucket won't
+            // double-drop.
+            let (key, value) =
+                unsafe { self.buckets[bucket_pool_idx].entries[i].assume_init_read() };
+            old_entries.push((hash, key, value));
+        }
+        self.buckets[bucket_pool_idx].len = 0;
+
+        // Redistribute entries based on the distinguishing bit at position
+        // `old_depth` (0-indexed from LSB).
+        for (hash, key, value) in old_entries {
+            if hash & bit != 0 {
+                self.buckets[new_bucket_pool_idx].push(hash, key, value);
             } else {
-                self.buckets[bucket_pool_idx].entries.push(entry);
+                self.buckets[bucket_pool_idx].push(hash, key, value);
             }
         }
 
@@ -217,6 +343,11 @@ impl<K: Clone, V: Clone> Clone for HashMapInner<K, V> {
 /// power-of-two array of bucket pointers — doubles when needed (a single
 /// `realloc` of pointer-sized elements), keeping worst-case insert cost
 /// proportional to the bucket size, not the table size.
+///
+/// Buckets use **inline storage** with a struct-of-arrays layout: hashes and
+/// key-value pairs are stored in fixed-size arrays inside the bucket struct
+/// (no per-bucket heap allocation). Lookups scan just the hash array (one
+/// cache line) before touching any key data.
 ///
 /// The API mirrors [`std::collections::HashMap`] so the crate can serve as a
 /// drop-in replacement.
@@ -273,10 +404,7 @@ impl<K, V, S> HashMap<K, V, S> {
         let mut buckets = Vec::with_capacity(dir_size);
         let mut directory = Vec::with_capacity(dir_size);
         for i in 0..dir_size {
-            buckets.push(Bucket {
-                local_depth: global_depth,
-                entries: Vec::with_capacity(BUCKET_CAPACITY),
-            });
+            buckets.push(Bucket::new(global_depth));
             directory.push(i);
         }
 
@@ -354,7 +482,7 @@ impl<K, V, S> HashMap<K, V, S> {
     /// buckets and directory.
     pub fn clear(&mut self) {
         for bucket in &mut self.inner.buckets {
-            bucket.entries.clear();
+            bucket.clear();
         }
         self.inner.len = 0;
     }
@@ -384,7 +512,8 @@ impl<K: Eq + Hash, V, S: BuildHasher> HashMap<K, V, S> {
     {
         let hash = self.hash_key(key);
         let (bi, ei) = self.inner.find(hash, key)?;
-        Some(&self.inner.buckets[bi].entries[ei].2)
+        // SAFETY: `find` guarantees `ei < bucket.len()`.
+        Some(&unsafe { self.inner.buckets[bi].entries[ei].assume_init_ref() }.1)
     }
 
     /// Returns the key-value pair corresponding to the supplied key.
@@ -396,8 +525,9 @@ impl<K: Eq + Hash, V, S: BuildHasher> HashMap<K, V, S> {
     {
         let hash = self.hash_key(key);
         let (bi, ei) = self.inner.find(hash, key)?;
-        let entry = &self.inner.buckets[bi].entries[ei];
-        Some((&entry.1, &entry.2))
+        // SAFETY: `find` guarantees `ei < bucket.len()`.
+        let (k, v) = unsafe { self.inner.buckets[bi].entries[ei].assume_init_ref() };
+        Some((k, v))
     }
 
     /// Returns a mutable reference to the value corresponding to the key.
@@ -409,7 +539,8 @@ impl<K: Eq + Hash, V, S: BuildHasher> HashMap<K, V, S> {
     {
         let hash = self.hash_key(key);
         let (bi, ei) = self.inner.find(hash, key)?;
-        Some(&mut self.inner.buckets[bi].entries[ei].2)
+        // SAFETY: `find` guarantees `ei < bucket.len()`.
+        Some(&mut unsafe { self.inner.buckets[bi].entries[ei].assume_init_mut() }.1)
     }
 
     /// Returns `true` if the map contains a value for the specified key.
@@ -430,7 +561,9 @@ impl<K: Eq + Hash, V, S: BuildHasher> HashMap<K, V, S> {
 
         // If the key already exists, overwrite in place.
         if let Some((bi, ei)) = self.inner.find(hash, &key) {
-            let old = std::mem::replace(&mut self.inner.buckets[bi].entries[ei].2, value);
+            // SAFETY: `find` guarantees `ei < bucket.len()`.
+            let entry = unsafe { self.inner.buckets[bi].entries[ei].assume_init_mut() };
+            let old = std::mem::replace(&mut entry.1, value);
             return Some(old);
         }
 
@@ -458,7 +591,7 @@ impl<K: Eq + Hash, V, S: BuildHasher> HashMap<K, V, S> {
         let hash = self.hash_key(key);
         let (bi, ei) = self.inner.find(hash, key)?;
         // swap_remove is O(1) and order within a bucket is irrelevant.
-        let (_, k, v) = self.inner.buckets[bi].entries.swap_remove(ei);
+        let (_, k, v) = self.inner.buckets[bi].swap_remove(ei);
         self.inner.len -= 1;
         Some((k, v))
     }
@@ -478,13 +611,14 @@ impl<K: Eq + Hash, V, S: BuildHasher> HashMap<K, V, S> {
     /// Creates a draining iterator that removes all entries from the map and
     /// yields them. The map is empty after this call returns.
     pub fn drain(&mut self) -> Drain<'_, K, V> {
-        // Eagerly collect entries from all buckets. This avoids the complexity
-        // of a lazy drain that must handle bucket/directory aliasing.
         let mut entries = Vec::with_capacity(self.inner.len);
         for bucket in &mut self.inner.buckets {
-            for (_, k, v) in bucket.entries.drain(..) {
-                entries.push((k, v));
+            for i in 0..bucket.len() {
+                // SAFETY: `i < bucket.len()`, so `entries[i]` is initialized.
+                let entry = unsafe { bucket.entries[i].assume_init_read() };
+                entries.push(entry);
             }
+            bucket.len = 0;
         }
         self.inner.len = 0;
         Drain::new(entries)
@@ -496,9 +630,18 @@ impl<K: Eq + Hash, V, S: BuildHasher> HashMap<K, V, S> {
         F: FnMut(&K, &mut V) -> bool,
     {
         for bucket in &mut self.inner.buckets {
-            let before = bucket.entries.len();
-            bucket.entries.retain_mut(|entry| f(&entry.1, &mut entry.2));
-            self.inner.len -= before - bucket.entries.len();
+            let mut i = 0;
+            while i < bucket.len() {
+                // SAFETY: `i < bucket.len()`, so `entries[i]` is initialized.
+                let entry = unsafe { bucket.entries[i].assume_init_mut() };
+                if f(&entry.0, &mut entry.1) {
+                    i += 1;
+                } else {
+                    bucket.swap_remove(i);
+                    self.inner.len -= 1;
+                    // Don't increment — the swapped-in entry needs checking.
+                }
+            }
         }
     }
 }
@@ -1284,7 +1427,8 @@ mod tests {
             // Every entry in this bucket should hash to this directory slot
             // (modulo the bucket's local_depth mask).
             let local_mask = (1usize << bucket.local_depth) - 1;
-            for &(hash, _, _) in &bucket.entries {
+            for i in 0..bucket.len() {
+                let hash = bucket.hashes[i];
                 assert_eq!(
                     hash as usize & local_mask,
                     slot & local_mask,
@@ -1308,7 +1452,7 @@ mod tests {
         assert_eq!(iter_count, map.len());
 
         // Verify via bucket pool directly.
-        let pool_count: usize = map.inner.buckets.iter().map(|b| b.entries.len()).sum();
+        let pool_count: usize = map.inner.buckets.iter().map(|b| b.len()).sum();
         assert_eq!(pool_count, 500);
     }
 }

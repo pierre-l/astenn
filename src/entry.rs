@@ -113,26 +113,37 @@ impl<'a, K, V> OccupiedEntry<'a, K, V> {
     /// Gets a reference to the key in the entry.
     #[inline]
     pub fn key(&self) -> &K {
-        &self.inner.buckets[self.bucket_idx].entries[self.entry_idx].1
+        // SAFETY: `entry_idx < bucket.len()` — guaranteed by `find` at
+        // construction time, and no mutation has occurred since.
+        &unsafe { self.inner.buckets[self.bucket_idx].entries[self.entry_idx].assume_init_ref() }.0
     }
 
     /// Gets a reference to the value in the entry.
     #[inline]
     pub fn get(&self) -> &V {
-        &self.inner.buckets[self.bucket_idx].entries[self.entry_idx].2
+        // SAFETY: same as `key`.
+        &unsafe { self.inner.buckets[self.bucket_idx].entries[self.entry_idx].assume_init_ref() }.1
     }
 
     /// Gets a mutable reference to the value in the entry.
     #[inline]
     pub fn get_mut(&mut self) -> &mut V {
-        &mut self.inner.buckets[self.bucket_idx].entries[self.entry_idx].2
+        // SAFETY: same as `key`, plus exclusive access via `&mut self`.
+        &mut unsafe {
+            self.inner.buckets[self.bucket_idx].entries[self.entry_idx].assume_init_mut()
+        }
+        .1
     }
 
     /// Converts the `OccupiedEntry` into a mutable reference to the value in
     /// the entry with a lifetime bound to the map itself.
     #[inline]
     pub fn into_mut(self) -> &'a mut V {
-        &mut self.inner.buckets[self.bucket_idx].entries[self.entry_idx].2
+        // SAFETY: same as `get_mut`; consuming `self` extends the borrow to `'a`.
+        &mut unsafe {
+            self.inner.buckets[self.bucket_idx].entries[self.entry_idx].assume_init_mut()
+        }
+        .1
     }
 
     /// Sets the value of the entry and returns the old value.
@@ -144,9 +155,7 @@ impl<'a, K, V> OccupiedEntry<'a, K, V> {
     /// Takes ownership of the key and value from the map.
     #[inline]
     pub fn remove_entry(self) -> (K, V) {
-        let (_, k, v) = self.inner.buckets[self.bucket_idx]
-            .entries
-            .swap_remove(self.entry_idx);
+        let (_, k, v) = self.inner.buckets[self.bucket_idx].swap_remove(self.entry_idx);
         self.inner.len -= 1;
         (k, v)
     }
@@ -185,6 +194,7 @@ impl<'a, K: Eq, V> VacantEntry<'a, K, V> {
     #[inline]
     pub fn insert(self, value: V) -> &'a mut V {
         let (bi, ei) = self.inner.insert_entry(self.hash, self.key, value);
-        &mut self.inner.buckets[bi].entries[ei].2
+        // SAFETY: `insert_entry` just placed the value at `(bi, ei)`.
+        &mut unsafe { self.inner.buckets[bi].entries[ei].assume_init_mut() }.1
     }
 }
