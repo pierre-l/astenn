@@ -3,3 +3,11 @@ name = "astenn"
 version = "0.1.0"
 edition = "2024"
 description = "Extendible hashing HashMap for Rust"
+
+[dev-dependencies]
+criterion = "0.5"
+rustc-hash = "2"
+
+[[bench]]
+name = "hashmap"
+harness = false
