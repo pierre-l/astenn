@@ -182,25 +182,33 @@ pub(crate) struct HashMapInner<K, V> {
     pub(crate) buckets: Vec<Bucket<K, V>>,
 
     pub(crate) global_depth: u8,
+
+    /// Precomputed `(1 << global_depth) - 1`. Stored to avoid a
+    /// shift+subtract on every `dir_index` call — the hottest instruction
+    /// in the lookup path. Always equal to `directory.len() - 1`.
+    mask: usize,
+
     pub(crate) len: usize,
 }
 
 impl<K, V> HashMapInner<K, V> {
-    /// Map a hash to its directory slot.
+    /// Map a hash to its directory slot. Uses the precomputed mask to avoid
+    /// a shift+subtract on every call.
     #[inline]
     fn dir_index(&self, hash: u64) -> usize {
-        // Use the low `global_depth` bits. When global_depth == 0 the
-        // directory has a single entry and the mask is 0, which is correct.
-        (hash as usize) & ((1usize << self.global_depth) - 1)
+        (hash as usize) & self.mask
     }
 }
 
 impl<K: Eq, V> HashMapInner<K, V> {
     /// Find `(bucket_pool_idx, entry_idx)` for a key, or `None`.
     ///
-    /// The lookup scans the bucket's hash array first (one cache line),
-    /// then only touches the key on a hash match. This keeps the common
-    /// "not found" path fast.
+    /// Hot-path optimizations:
+    /// - `get_unchecked` on directory and bucket access (indices are always
+    ///   valid — `dir_idx` is masked, `bucket_idx` comes from our directory).
+    /// - Fixed-iteration hash scan: all `BUCKET_CAPACITY` hashes are compared
+    ///   unconditionally, then invalid slots are masked out. The fixed trip
+    ///   count enables the compiler to unroll/vectorize the loop.
     #[inline]
     fn find<Q>(&self, hash: u64, key: &Q) -> Option<(usize, usize)>
     where
@@ -208,16 +216,35 @@ impl<K: Eq, V> HashMapInner<K, V> {
         Q: Eq + ?Sized,
     {
         let dir_idx = self.dir_index(hash);
-        let bucket_idx = self.directory[dir_idx] as usize;
-        let bucket = &self.buckets[bucket_idx];
-        for i in 0..bucket.len() {
-            if bucket.hashes[i] == hash {
-                // Hash match — compare the actual key.
-                // SAFETY: `i < bucket.len()`, so `entries[i]` is initialized.
-                let (k, _) = unsafe { bucket.entries[i].assume_init_ref() };
-                if k.borrow() == key {
-                    return Some((bucket_idx, i));
-                }
+        // SAFETY: `dir_idx = hash & mask` where `mask = directory.len() - 1`,
+        // so `dir_idx` is always in bounds.
+        let bucket_idx = unsafe { *self.directory.get_unchecked(dir_idx) } as usize;
+        // SAFETY: all directory entries are valid bucket pool indices,
+        // maintained by `with_capacity_and_hasher` and `split_bucket`.
+        let bucket = unsafe { self.buckets.get_unchecked(bucket_idx) };
+        let len = bucket.len();
+
+        // Fixed-iteration scan: compare all BUCKET_CAPACITY hashes against
+        // the target. `hashes` is a plain `[u64; 8]` (not MaybeUninit), so
+        // reading all slots is safe even beyond `len` — they hold 0 or stale
+        // values. The fixed trip count lets the compiler unroll or vectorize.
+        let mut match_bits: u32 = 0;
+        for i in 0..BUCKET_CAPACITY {
+            if unsafe { *bucket.hashes.get_unchecked(i) } == hash {
+                match_bits |= 1 << i;
+            }
+        }
+        // Clear bits for uninitialized entries (i >= len).
+        match_bits &= (1u32 << len) - 1;
+
+        // Iterate only the matching positions (usually 0 or 1).
+        while match_bits != 0 {
+            let i = match_bits.trailing_zeros() as usize;
+            match_bits &= match_bits - 1; // clear lowest set bit
+            // SAFETY: `i < len` because we masked out bits >= len above.
+            let (k, _) = unsafe { bucket.entries.get_unchecked(i).assume_init_ref() };
+            if k.borrow() == key {
+                return Some((bucket_idx, i));
             }
         }
         None
@@ -228,7 +255,9 @@ impl<K: Eq, V> HashMapInner<K, V> {
     pub(crate) fn insert_entry(&mut self, hash: u64, key: K, value: V) -> (usize, usize) {
         loop {
             let dir_idx = self.dir_index(hash);
-            let bucket_pool_idx = self.directory[dir_idx] as usize;
+            // SAFETY: same as `find` — dir_idx is masked, directory entries
+            // are valid bucket indices.
+            let bucket_pool_idx = unsafe { *self.directory.get_unchecked(dir_idx) } as usize;
 
             if self.buckets[bucket_pool_idx].len() < BUCKET_CAPACITY
                 || self.buckets[bucket_pool_idx].local_depth >= MAX_LOCAL_DEPTH
@@ -271,6 +300,7 @@ impl<K: Eq, V> HashMapInner<K, V> {
             let old_size = self.directory.len();
             self.directory.extend_from_within(0..old_size);
             self.global_depth += 1;
+            self.mask = self.directory.len() - 1;
         }
 
         // Create the sibling bucket.
@@ -333,6 +363,7 @@ impl<K: Clone, V: Clone> Clone for HashMapInner<K, V> {
             directory: self.directory.clone(),
             buckets: self.buckets.clone(),
             global_depth: self.global_depth,
+            mask: self.mask,
             len: self.len,
         }
     }
@@ -420,6 +451,7 @@ impl<K, V, S> HashMap<K, V, S> {
                 directory,
                 buckets,
                 global_depth,
+                mask: dir_size - 1,
                 len: 0,
             },
             hash_builder,
