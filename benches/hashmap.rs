@@ -15,8 +15,11 @@ type Key = (u32, u64);
 /// (Side, Price) — simulated 16-byte value.
 type Value = (u8, u64);
 
+/// Default bucket capacity — matches astenn's default.
+const N: usize = astenn::DEFAULT_BUCKET_CAPACITY;
+
 /// Build a pre-populated astenn map with `n` entries and FxHash.
-fn astenn_map(n: usize) -> astenn::HashMap<Key, Value, FxBuildHasher> {
+fn astenn_map(n: usize) -> astenn::HashMap<Key, Value, FxBuildHasher, N> {
     let mut map = astenn::HashMap::with_capacity_and_hasher(n, FxBuildHasher);
     for i in 0..n as u64 {
         map.insert((i as u32, i), (i as u8, i * 100));
@@ -114,7 +117,12 @@ fn bench_insert_new(c: &mut Criterion) {
     for &size in &[SIZE_BOOK, SIZE_GLOBAL] {
         group.bench_with_input(BenchmarkId::new("astenn", size), &size, |b, &n| {
             b.iter_batched(
-                || astenn::HashMap::with_capacity_and_hasher(n, FxBuildHasher),
+                || {
+                    astenn::HashMap::<Key, Value, FxBuildHasher, N>::with_capacity_and_hasher(
+                        n,
+                        FxBuildHasher,
+                    )
+                },
                 |mut map| {
                     for i in 0..n as u64 {
                         map.insert(black_box((i as u32, i)), (i as u8, i * 100));

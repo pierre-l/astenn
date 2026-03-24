@@ -1,3 +1,4 @@
+use crate::DEFAULT_BUCKET_CAPACITY;
 use crate::map::Bucket;
 
 // ---------------------------------------------------------------------------
@@ -5,13 +6,13 @@ use crate::map::Bucket;
 // ---------------------------------------------------------------------------
 
 /// An iterator over the entries of a `HashMap`.
-pub struct Iter<'a, K, V> {
-    buckets: std::slice::Iter<'a, Bucket<K, V>>,
+pub struct Iter<'a, K, V, const N: usize = DEFAULT_BUCKET_CAPACITY> {
+    buckets: std::slice::Iter<'a, Bucket<K, V, N>>,
     current: std::slice::Iter<'a, (K, V)>,
 }
 
-impl<'a, K, V> Iter<'a, K, V> {
-    pub(crate) fn new(buckets: &'a [Bucket<K, V>]) -> Self {
+impl<'a, K, V, const N: usize> Iter<'a, K, V, N> {
+    pub(crate) fn new(buckets: &'a [Bucket<K, V, N>]) -> Self {
         Self {
             buckets: buckets.iter(),
             current: [].iter(),
@@ -19,7 +20,7 @@ impl<'a, K, V> Iter<'a, K, V> {
     }
 }
 
-impl<'a, K, V> Iterator for Iter<'a, K, V> {
+impl<'a, K, V, const N: usize> Iterator for Iter<'a, K, V, N> {
     type Item = (&'a K, &'a V);
 
     #[inline]
@@ -44,13 +45,13 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
 // ---------------------------------------------------------------------------
 
 /// A mutable iterator over the entries of a `HashMap`.
-pub struct IterMut<'a, K, V> {
-    buckets: std::slice::IterMut<'a, Bucket<K, V>>,
+pub struct IterMut<'a, K, V, const N: usize = DEFAULT_BUCKET_CAPACITY> {
+    buckets: std::slice::IterMut<'a, Bucket<K, V, N>>,
     current: std::slice::IterMut<'a, (K, V)>,
 }
 
-impl<'a, K, V> IterMut<'a, K, V> {
-    pub(crate) fn new(buckets: &'a mut [Bucket<K, V>]) -> Self {
+impl<'a, K, V, const N: usize> IterMut<'a, K, V, N> {
+    pub(crate) fn new(buckets: &'a mut [Bucket<K, V, N>]) -> Self {
         Self {
             buckets: buckets.iter_mut(),
             current: [].iter_mut(),
@@ -58,7 +59,7 @@ impl<'a, K, V> IterMut<'a, K, V> {
     }
 }
 
-impl<'a, K, V> Iterator for IterMut<'a, K, V> {
+impl<'a, K, V, const N: usize> Iterator for IterMut<'a, K, V, N> {
     type Item = (&'a K, &'a mut V);
 
     #[inline]
@@ -81,12 +82,12 @@ impl<'a, K, V> Iterator for IterMut<'a, K, V> {
 /// An owning iterator over the entries of a `HashMap`. Constructed by
 /// consuming the map; entries are collected eagerly from the inline
 /// bucket storage.
-pub struct IntoIter<K, V> {
+pub struct IntoIter<K, V, const N: usize = DEFAULT_BUCKET_CAPACITY> {
     iter: std::vec::IntoIter<(K, V)>,
 }
 
-impl<K, V> IntoIter<K, V> {
-    pub(crate) fn new(mut buckets: Vec<Bucket<K, V>>) -> Self {
+impl<K, V, const N: usize> IntoIter<K, V, N> {
+    pub(crate) fn new(mut buckets: Vec<Bucket<K, V, N>>) -> Self {
         let total: usize = buckets.iter().map(|b| b.len()).sum();
         let mut entries = Vec::with_capacity(total);
         for bucket in &mut buckets {
@@ -104,7 +105,7 @@ impl<K, V> IntoIter<K, V> {
     }
 }
 
-impl<K, V> Iterator for IntoIter<K, V> {
+impl<K, V, const N: usize> Iterator for IntoIter<K, V, N> {
     type Item = (K, V);
 
     #[inline]
@@ -122,9 +123,9 @@ impl<K, V> Iterator for IntoIter<K, V> {
 // ---------------------------------------------------------------------------
 
 /// An iterator over the keys of a `HashMap`.
-pub struct Keys<'a, K, V>(pub(crate) Iter<'a, K, V>);
+pub struct Keys<'a, K, V, const N: usize = DEFAULT_BUCKET_CAPACITY>(pub(crate) Iter<'a, K, V, N>);
 
-impl<'a, K, V> Iterator for Keys<'a, K, V> {
+impl<'a, K, V, const N: usize> Iterator for Keys<'a, K, V, N> {
     type Item = &'a K;
 
     #[inline]
@@ -134,9 +135,9 @@ impl<'a, K, V> Iterator for Keys<'a, K, V> {
 }
 
 /// An iterator over the values of a `HashMap`.
-pub struct Values<'a, K, V>(pub(crate) Iter<'a, K, V>);
+pub struct Values<'a, K, V, const N: usize = DEFAULT_BUCKET_CAPACITY>(pub(crate) Iter<'a, K, V, N>);
 
-impl<'a, K, V> Iterator for Values<'a, K, V> {
+impl<'a, K, V, const N: usize> Iterator for Values<'a, K, V, N> {
     type Item = &'a V;
 
     #[inline]
@@ -146,9 +147,11 @@ impl<'a, K, V> Iterator for Values<'a, K, V> {
 }
 
 /// A mutable iterator over the values of a `HashMap`.
-pub struct ValuesMut<'a, K, V>(pub(crate) IterMut<'a, K, V>);
+pub struct ValuesMut<'a, K, V, const N: usize = DEFAULT_BUCKET_CAPACITY>(
+    pub(crate) IterMut<'a, K, V, N>,
+);
 
-impl<'a, K, V> Iterator for ValuesMut<'a, K, V> {
+impl<'a, K, V, const N: usize> Iterator for ValuesMut<'a, K, V, N> {
     type Item = &'a mut V;
 
     #[inline]

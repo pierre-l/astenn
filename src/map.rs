@@ -5,13 +5,9 @@ use std::hash::{BuildHasher, Hash};
 use std::mem::MaybeUninit;
 use std::ops::Index;
 
+use crate::DEFAULT_BUCKET_CAPACITY;
 use crate::entry::{Entry, OccupiedEntry, VacantEntry};
 use crate::iter::{Drain, IntoIter, Iter, IterMut, Keys, Values, ValuesMut};
-
-/// Entries per bucket before a split is attempted. 8 entries keeps the hash
-/// array at exactly 64 bytes (one cache line) and the total bucket size
-/// around 5 cache lines for typical Melin entry sizes.
-const BUCKET_CAPACITY: usize = 8;
 
 /// Maximum local depth — bounded by the number of usable bits in a u64 hash.
 /// Once a bucket reaches this depth, further splits cannot redistribute
@@ -28,33 +24,37 @@ const MAX_LOCAL_DEPTH: u8 = 64;
 /// are contiguous in memory with the bucket metadata.
 ///
 /// `repr(C, align(64))` guarantees the hash array starts at offset 0 — the
-/// beginning of a cache line. A lookup scans only this 64-byte array (one
-/// cache line) before touching any keys or values, so the common case (no
-/// match) never reads beyond one cache line of entry data.
+/// beginning of a cache line. A lookup scans only this array before touching
+/// any keys or values, so the common case (no match) never reads beyond the
+/// hash data.
+///
+/// The const generic `N` controls the number of entries per bucket. The
+/// default (8) places the hash array at exactly one cache line (64 bytes).
+/// Smaller values (e.g. 4) reduce per-lookup scan cost and bucket pool
+/// footprint at the expense of more frequent splits.
 ///
 /// Multiple directory slots may point to the same bucket when
 /// `local_depth < global_depth`.
 #[repr(C, align(64))]
-pub(crate) struct Bucket<K, V> {
+pub(crate) struct Bucket<K, V, const N: usize> {
     /// Hash values, indexed `0..len`. **First field** so it sits at the
-    /// cache-line-aligned start of the struct. 8 × u64 = 64 bytes = exactly
-    /// one cache line — the lookup hot path reads only this line.
-    pub(crate) hashes: [u64; BUCKET_CAPACITY],
+    /// cache-line-aligned start of the struct.
+    pub(crate) hashes: [u64; N],
     /// Key-value pairs, indexed `0..len`. Only `entries[0..len]` are
     /// initialized; the rest are `MaybeUninit`.
-    pub(crate) entries: [MaybeUninit<(K, V)>; BUCKET_CAPACITY],
+    pub(crate) entries: [MaybeUninit<(K, V)>; N],
     pub(crate) local_depth: u8,
     /// Number of initialized entries in `hashes` and `entries`. Invariant:
-    /// `len <= BUCKET_CAPACITY`.
+    /// `len <= N`.
     pub(crate) len: u8,
 }
 
-impl<K, V> Bucket<K, V> {
+impl<K, V, const N: usize> Bucket<K, V, N> {
     fn new(local_depth: u8) -> Self {
         Self {
-            hashes: [0; BUCKET_CAPACITY],
+            hashes: [0; N],
             // SAFETY: An array of MaybeUninit doesn't require initialization.
-            entries: [const { MaybeUninit::uninit() }; BUCKET_CAPACITY],
+            entries: [const { MaybeUninit::uninit() }; N],
             local_depth,
             len: 0,
         }
@@ -71,7 +71,7 @@ impl<K, V> Bucket<K, V> {
     fn push(&mut self, hash: u64, key: K, value: V) {
         let idx = self.len as usize;
         debug_assert!(
-            idx < BUCKET_CAPACITY,
+            idx < N,
             "bucket overflow at local_depth={}",
             self.local_depth
         );
@@ -106,11 +106,6 @@ impl<K, V> Bucket<K, V> {
     }
 
     /// Return a slice over the initialized key-value pairs.
-    ///
-    /// # Safety
-    ///
-    /// The returned slice borrows `self` — it is only valid while
-    /// the bucket is not mutated.
     pub(crate) fn entries_slice(&self) -> &[(K, V)] {
         // SAFETY: `entries[0..len]` are all initialized, and `MaybeUninit<T>`
         // has the same layout as `T`.
@@ -137,7 +132,7 @@ impl<K, V> Bucket<K, V> {
     }
 }
 
-impl<K, V> Drop for Bucket<K, V> {
+impl<K, V, const N: usize> Drop for Bucket<K, V, N> {
     fn drop(&mut self) {
         for i in 0..self.len as usize {
             // SAFETY: `i < len`, so `entries[i]` is initialized.
@@ -148,7 +143,7 @@ impl<K, V> Drop for Bucket<K, V> {
     }
 }
 
-impl<K: Clone, V: Clone> Clone for Bucket<K, V> {
+impl<K: Clone, V: Clone, const N: usize> Clone for Bucket<K, V, N> {
     fn clone(&self) -> Self {
         let mut new = Self::new(self.local_depth);
         for i in 0..self.len as usize {
@@ -167,7 +162,7 @@ impl<K: Clone, V: Clone> Clone for Bucket<K, V> {
 /// The guts of the hash map, deliberately separated from the hasher so that
 /// [`Entry`], [`OccupiedEntry`], and [`VacantEntry`] do not need to carry the
 /// `S` type parameter (matching the `std::collections::HashMap` entry API).
-pub(crate) struct HashMapInner<K, V> {
+pub(crate) struct HashMapInner<K, V, const N: usize = DEFAULT_BUCKET_CAPACITY> {
     /// Directory of bucket indices. Length is always `2^global_depth`.
     /// `u32` instead of `usize` halves the directory footprint (e.g. a
     /// 32K-entry directory drops from 256 KB to 128 KB), keeping it
@@ -179,7 +174,7 @@ pub(crate) struct HashMapInner<K, V> {
     /// references buckets by their index in this vec. Buckets are never
     /// removed (no merge on delete) — this keeps the pool dense and avoids
     /// index invalidation.
-    pub(crate) buckets: Vec<Bucket<K, V>>,
+    pub(crate) buckets: Vec<Bucket<K, V, N>>,
 
     pub(crate) global_depth: u8,
 
@@ -191,7 +186,7 @@ pub(crate) struct HashMapInner<K, V> {
     pub(crate) len: usize,
 }
 
-impl<K, V> HashMapInner<K, V> {
+impl<K, V, const N: usize> HashMapInner<K, V, N> {
     /// Map a hash to its directory slot. Uses the precomputed mask to avoid
     /// a shift+subtract on every call.
     #[inline]
@@ -200,13 +195,13 @@ impl<K, V> HashMapInner<K, V> {
     }
 }
 
-impl<K: Eq, V> HashMapInner<K, V> {
+impl<K: Eq, V, const N: usize> HashMapInner<K, V, N> {
     /// Find `(bucket_pool_idx, entry_idx)` for a key, or `None`.
     ///
     /// Hot-path optimizations:
     /// - `get_unchecked` on directory and bucket access (indices are always
     ///   valid — `dir_idx` is masked, `bucket_idx` comes from our directory).
-    /// - Fixed-iteration hash scan: all `BUCKET_CAPACITY` hashes are compared
+    /// - Fixed-iteration hash scan: all `N` hashes are compared
     ///   unconditionally, then invalid slots are masked out. The fixed trip
     ///   count enables the compiler to unroll/vectorize the loop.
     #[inline]
@@ -224,12 +219,13 @@ impl<K: Eq, V> HashMapInner<K, V> {
         let bucket = unsafe { self.buckets.get_unchecked(bucket_idx) };
         let len = bucket.len();
 
-        // Fixed-iteration scan: compare all BUCKET_CAPACITY hashes against
-        // the target. `hashes` is a plain `[u64; 8]` (not MaybeUninit), so
-        // reading all slots is safe even beyond `len` — they hold 0 or stale
-        // values. The fixed trip count lets the compiler unroll or vectorize.
+        // Fixed-iteration scan: compare all N hashes against the target.
+        // `hashes` is a plain `[u64; N]` (not MaybeUninit), so reading all
+        // slots is safe even beyond `len` — they hold 0 or stale values.
+        // The fixed trip count lets the compiler unroll this into branchless
+        // straight-line code.
         let mut match_bits: u32 = 0;
-        for i in 0..BUCKET_CAPACITY {
+        for i in 0..N {
             if unsafe { *bucket.hashes.get_unchecked(i) } == hash {
                 match_bits |= 1 << i;
             }
@@ -259,7 +255,7 @@ impl<K: Eq, V> HashMapInner<K, V> {
             // are valid bucket indices.
             let bucket_pool_idx = unsafe { *self.directory.get_unchecked(dir_idx) } as usize;
 
-            if self.buckets[bucket_pool_idx].len() < BUCKET_CAPACITY
+            if self.buckets[bucket_pool_idx].len() < N
                 || self.buckets[bucket_pool_idx].local_depth >= MAX_LOCAL_DEPTH
             {
                 let entry_idx = self.buckets[bucket_pool_idx].len();
@@ -279,7 +275,7 @@ impl<K: Eq, V> HashMapInner<K, V> {
     ///
     /// Cost breakdown:
     /// - Directory doubling (when needed): O(directory_size) memcpy
-    /// - Entry redistribution: O(BUCKET_CAPACITY)
+    /// - Entry redistribution: O(N)
     /// - Directory pointer update: O(2^(global_depth - local_depth)),
     ///   i.e. proportional to the number of directory slots aliasing this
     ///   bucket, NOT the full directory size.
@@ -309,12 +305,11 @@ impl<K: Eq, V> HashMapInner<K, V> {
         self.buckets[bucket_pool_idx].local_depth = new_depth;
 
         // Collect entries from the old bucket into a stack-allocated buffer.
-        // No heap allocation — BUCKET_CAPACITY is small (8).
+        // No heap allocation — N is small (typically 4-8).
         let bit = 1u64 << old_depth;
         let n = self.buckets[bucket_pool_idx].len();
-        let mut hashes_buf = [0u64; BUCKET_CAPACITY];
-        let mut entries_buf: [MaybeUninit<(K, V)>; BUCKET_CAPACITY] =
-            [const { MaybeUninit::uninit() }; BUCKET_CAPACITY];
+        let mut hashes_buf = [0u64; N];
+        let mut entries_buf: [MaybeUninit<(K, V)>; N] = [const { MaybeUninit::uninit() }; N];
         for i in 0..n {
             hashes_buf[i] = self.buckets[bucket_pool_idx].hashes[i];
             // SAFETY: `i < len`, so `entries[i]` is initialized. `assume_init_read`
@@ -344,11 +339,11 @@ impl<K: Eq, V> HashMapInner<K, V> {
         // sibling). The affected slots start at `base_pattern | bit` and
         // repeat every `1 << new_depth` entries — touching exactly
         // 2^(global_depth - new_depth) slots instead of the full directory.
+        let bucket_pool_idx_u32 = bucket_pool_idx as u32;
+        let new_bucket_idx_u32 = new_bucket_idx as u32;
         let new_start = base_pattern | bit as usize;
         let step = 1usize << new_depth;
         let dir_size = self.directory.len();
-        let bucket_pool_idx_u32 = bucket_pool_idx as u32;
-        let new_bucket_idx_u32 = new_bucket_idx as u32;
         let mut slot = new_start;
         while slot < dir_size {
             debug_assert_eq!(
@@ -362,7 +357,7 @@ impl<K: Eq, V> HashMapInner<K, V> {
     }
 }
 
-impl<K: Clone, V: Clone> Clone for HashMapInner<K, V> {
+impl<K: Clone, V: Clone, const N: usize> Clone for HashMapInner<K, V, N> {
     fn clone(&self) -> Self {
         Self {
             directory: self.directory.clone(),
@@ -389,20 +384,27 @@ impl<K: Clone, V: Clone> Clone for HashMapInner<K, V> {
 ///
 /// Buckets use **inline storage** with a struct-of-arrays layout: hashes and
 /// key-value pairs are stored in fixed-size arrays inside the bucket struct
-/// (no per-bucket heap allocation). Lookups scan just the hash array (one
-/// cache line) before touching any key data.
+/// (no per-bucket heap allocation). Lookups scan just the hash array before
+/// touching any key data.
+///
+/// # Bucket capacity (`N`)
+///
+/// The const generic `N` controls entries per bucket. The default (8) puts
+/// the hash array at exactly one cache line (64 bytes). Smaller values
+/// (e.g. 4) reduce per-lookup scan cost and bucket pool footprint at the
+/// expense of more frequent splits. Larger values (e.g. 16) do the opposite.
 ///
 /// The API mirrors [`std::collections::HashMap`] so the crate can serve as a
 /// drop-in replacement.
-pub struct HashMap<K, V, S = RandomState> {
-    pub(crate) inner: HashMapInner<K, V>,
+pub struct HashMap<K, V, S = RandomState, const N: usize = DEFAULT_BUCKET_CAPACITY> {
+    pub(crate) inner: HashMapInner<K, V, N>,
     hash_builder: S,
 }
 
 // --- Construction ----------------------------------------------------------
 
-impl<K, V> HashMap<K, V, RandomState> {
-    /// Creates an empty `HashMap`.
+impl<K, V> HashMap<K, V> {
+    /// Creates an empty `HashMap` with the default bucket capacity.
     #[inline]
     #[must_use]
     pub fn new() -> Self {
@@ -410,7 +412,7 @@ impl<K, V> HashMap<K, V, RandomState> {
     }
 
     /// Creates an empty `HashMap` with space for at least `capacity` entries
-    /// without splitting.
+    /// without splitting, using the default bucket capacity.
     #[inline]
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
@@ -418,7 +420,7 @@ impl<K, V> HashMap<K, V, RandomState> {
     }
 }
 
-impl<K, V, S> HashMap<K, V, S> {
+impl<K, V, S, const N: usize> HashMap<K, V, S, N> {
     /// Creates an empty `HashMap` using the given hash builder.
     #[inline]
     #[must_use]
@@ -432,14 +434,13 @@ impl<K, V, S> HashMap<K, V, S> {
     /// before any bucket split occurs.
     #[must_use]
     pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> Self {
-        // Determine how many buckets we need. Each bucket holds
-        // BUCKET_CAPACITY entries, and the directory size must be a power of
-        // two. For capacity == 0 we start with a single bucket (global_depth
-        // 0, directory size 1).
+        // Determine how many buckets we need. Each bucket holds N entries,
+        // and the directory size must be a power of two. For capacity == 0
+        // we start with a single bucket (global_depth 0, directory size 1).
         let num_buckets = if capacity == 0 {
             1
         } else {
-            capacity.div_ceil(BUCKET_CAPACITY).next_power_of_two()
+            capacity.div_ceil(N).next_power_of_two()
         };
         let global_depth = num_buckets.trailing_zeros() as u8;
         let dir_size = 1usize << global_depth;
@@ -447,9 +448,8 @@ impl<K, V, S> HashMap<K, V, S> {
         // Reserve 2× the initial bucket count. Under uniform hashing, each
         // initial bucket splits roughly once as the map fills to capacity,
         // doubling the bucket count. Pre-allocating avoids a Vec reallocation
-        // that would memcpy ALL bucket data (~384 bytes per bucket with
-        // align(64)), which would defeat the "only touch one bucket per
-        // split" latency guarantee.
+        // that would memcpy ALL bucket data, which would defeat the "only
+        // touch one bucket per split" latency guarantee.
         let mut buckets = Vec::with_capacity(dir_size.saturating_mul(2).max(1));
         let mut directory: Vec<u32> = Vec::with_capacity(dir_size);
         for i in 0..dir_size {
@@ -495,36 +495,36 @@ impl<K, V, S> HashMap<K, V, S> {
     #[inline]
     #[must_use]
     pub fn capacity(&self) -> usize {
-        self.inner.buckets.len() * BUCKET_CAPACITY
+        self.inner.buckets.len() * N
     }
 
     /// An iterator visiting all key-value pairs in arbitrary order.
     #[inline]
-    pub fn iter(&self) -> Iter<'_, K, V> {
+    pub fn iter(&self) -> Iter<'_, K, V, N> {
         Iter::new(&self.inner.buckets)
     }
 
     /// A mutable iterator visiting all key-value pairs in arbitrary order.
     #[inline]
-    pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
+    pub fn iter_mut(&mut self) -> IterMut<'_, K, V, N> {
         IterMut::new(&mut self.inner.buckets)
     }
 
     /// An iterator visiting all keys in arbitrary order.
     #[inline]
-    pub fn keys(&self) -> Keys<'_, K, V> {
+    pub fn keys(&self) -> Keys<'_, K, V, N> {
         Keys(self.iter())
     }
 
     /// An iterator visiting all values in arbitrary order.
     #[inline]
-    pub fn values(&self) -> Values<'_, K, V> {
+    pub fn values(&self) -> Values<'_, K, V, N> {
         Values(self.iter())
     }
 
     /// A mutable iterator visiting all values in arbitrary order.
     #[inline]
-    pub fn values_mut(&mut self) -> ValuesMut<'_, K, V> {
+    pub fn values_mut(&mut self) -> ValuesMut<'_, K, V, N> {
         ValuesMut(self.iter_mut())
     }
 
@@ -540,7 +540,7 @@ impl<K, V, S> HashMap<K, V, S> {
 
 // --- Hashing helper --------------------------------------------------------
 
-impl<K, V, S: BuildHasher> HashMap<K, V, S> {
+impl<K, V, S: BuildHasher, const N: usize> HashMap<K, V, S, N> {
     #[inline]
     fn hash_key<Q>(&self, key: &Q) -> u64
     where
@@ -552,7 +552,7 @@ impl<K, V, S: BuildHasher> HashMap<K, V, S> {
 
 // --- Lookup / mutation (requires K: Eq + Hash, S: BuildHasher) -------------
 
-impl<K: Eq + Hash, V, S: BuildHasher> HashMap<K, V, S> {
+impl<K: Eq + Hash, V, S: BuildHasher, const N: usize> HashMap<K, V, S, N> {
     /// Returns a reference to the value corresponding to the key.
     #[inline]
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
@@ -649,7 +649,7 @@ impl<K: Eq + Hash, V, S: BuildHasher> HashMap<K, V, S> {
     /// Gets the given key's corresponding entry in the map for in-place
     /// manipulation.
     #[inline]
-    pub fn entry(&mut self, key: K) -> Entry<'_, K, V> {
+    pub fn entry(&mut self, key: K) -> Entry<'_, K, V, N> {
         let hash = self.hash_key(&key);
         if let Some((bi, ei)) = self.inner.find(hash, &key) {
             Entry::Occupied(OccupiedEntry::new(&mut self.inner, bi, ei))
@@ -698,14 +698,14 @@ impl<K: Eq + Hash, V, S: BuildHasher> HashMap<K, V, S> {
 
 // --- Trait impls -----------------------------------------------------------
 
-impl<K, V, S: Default> Default for HashMap<K, V, S> {
+impl<K, V, S: Default, const N: usize> Default for HashMap<K, V, S, N> {
     #[inline]
     fn default() -> Self {
         Self::with_hasher(S::default())
     }
 }
 
-impl<K: Clone, V: Clone, S: Clone> Clone for HashMap<K, V, S> {
+impl<K: Clone, V: Clone, S: Clone, const N: usize> Clone for HashMap<K, V, S, N> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -714,13 +714,13 @@ impl<K: Clone, V: Clone, S: Clone> Clone for HashMap<K, V, S> {
     }
 }
 
-impl<K: fmt::Debug, V: fmt::Debug, S> fmt::Debug for HashMap<K, V, S> {
+impl<K: fmt::Debug, V: fmt::Debug, S, const N: usize> fmt::Debug for HashMap<K, V, S, N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map().entries(self.iter()).finish()
     }
 }
 
-impl<K: Eq + Hash, V: PartialEq, S: BuildHasher> PartialEq for HashMap<K, V, S> {
+impl<K: Eq + Hash, V: PartialEq, S: BuildHasher, const N: usize> PartialEq for HashMap<K, V, S, N> {
     fn eq(&self, other: &Self) -> bool {
         if self.len() != other.len() {
             return false;
@@ -730,9 +730,9 @@ impl<K: Eq + Hash, V: PartialEq, S: BuildHasher> PartialEq for HashMap<K, V, S> 
     }
 }
 
-impl<K: Eq + Hash, V: Eq, S: BuildHasher> Eq for HashMap<K, V, S> {}
+impl<K: Eq + Hash, V: Eq, S: BuildHasher, const N: usize> Eq for HashMap<K, V, S, N> {}
 
-impl<K: Eq + Hash, Q: ?Sized, V, S: BuildHasher> Index<&Q> for HashMap<K, V, S>
+impl<K: Eq + Hash, Q: ?Sized, V, S: BuildHasher, const N: usize> Index<&Q> for HashMap<K, V, S, N>
 where
     K: Borrow<Q>,
     Q: Eq + Hash,
@@ -750,7 +750,9 @@ where
     }
 }
 
-impl<K: Eq + Hash, V, S: BuildHasher + Default> FromIterator<(K, V)> for HashMap<K, V, S> {
+impl<K: Eq + Hash, V, S: BuildHasher + Default, const N: usize> FromIterator<(K, V)>
+    for HashMap<K, V, S, N>
+{
     fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
         let iter = iter.into_iter();
         let (lower, _) = iter.size_hint();
@@ -760,7 +762,7 @@ impl<K: Eq + Hash, V, S: BuildHasher + Default> FromIterator<(K, V)> for HashMap
     }
 }
 
-impl<K: Eq + Hash, V, S: BuildHasher> Extend<(K, V)> for HashMap<K, V, S> {
+impl<K: Eq + Hash, V, S: BuildHasher, const N: usize> Extend<(K, V)> for HashMap<K, V, S, N> {
     fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
         for (k, v) in iter {
             self.insert(k, v);
@@ -768,7 +770,9 @@ impl<K: Eq + Hash, V, S: BuildHasher> Extend<(K, V)> for HashMap<K, V, S> {
     }
 }
 
-impl<'a, K: Eq + Hash + Copy, V: Copy, S: BuildHasher> Extend<(&'a K, &'a V)> for HashMap<K, V, S> {
+impl<'a, K: Eq + Hash + Copy, V: Copy, S: BuildHasher, const N: usize> Extend<(&'a K, &'a V)>
+    for HashMap<K, V, S, N>
+{
     fn extend<I: IntoIterator<Item = (&'a K, &'a V)>>(&mut self, iter: I) {
         for (&k, &v) in iter {
             self.insert(k, v);
@@ -776,29 +780,29 @@ impl<'a, K: Eq + Hash + Copy, V: Copy, S: BuildHasher> Extend<(&'a K, &'a V)> fo
     }
 }
 
-impl<K, V, S> IntoIterator for HashMap<K, V, S> {
+impl<K, V, S, const N: usize> IntoIterator for HashMap<K, V, S, N> {
     type Item = (K, V);
-    type IntoIter = IntoIter<K, V>;
+    type IntoIter = IntoIter<K, V, N>;
 
-    fn into_iter(self) -> IntoIter<K, V> {
+    fn into_iter(self) -> IntoIter<K, V, N> {
         IntoIter::new(self.inner.buckets)
     }
 }
 
-impl<'a, K, V, S> IntoIterator for &'a HashMap<K, V, S> {
+impl<'a, K, V, S, const N: usize> IntoIterator for &'a HashMap<K, V, S, N> {
     type Item = (&'a K, &'a V);
-    type IntoIter = Iter<'a, K, V>;
+    type IntoIter = Iter<'a, K, V, N>;
 
-    fn into_iter(self) -> Iter<'a, K, V> {
+    fn into_iter(self) -> Iter<'a, K, V, N> {
         self.iter()
     }
 }
 
-impl<'a, K, V, S> IntoIterator for &'a mut HashMap<K, V, S> {
+impl<'a, K, V, S, const N: usize> IntoIterator for &'a mut HashMap<K, V, S, N> {
     type Item = (&'a K, &'a mut V);
-    type IntoIter = IterMut<'a, K, V>;
+    type IntoIter = IterMut<'a, K, V, N>;
 
-    fn into_iter(self) -> IterMut<'a, K, V> {
+    fn into_iter(self) -> IterMut<'a, K, V, N> {
         self.iter_mut()
     }
 }
@@ -895,8 +899,6 @@ mod tests {
 
     #[test]
     fn insert_triggers_splits() {
-        // Insert enough entries to force multiple bucket splits and directory
-        // doublings. Verify all entries are retrievable afterwards.
         let mut map = HashMap::new();
         let n = 1000;
         for i in 0..n {
@@ -911,8 +913,6 @@ mod tests {
     #[test]
     fn with_capacity_avoids_early_splits() {
         let map: HashMap<u32, u32> = HashMap::with_capacity(100);
-        // Should have at least 100 / BUCKET_CAPACITY buckets, rounded up to
-        // power of two.
         assert!(map.capacity() >= 100);
     }
 
@@ -931,14 +931,40 @@ mod tests {
                 "missing key {i}"
             );
         }
-        // Remove half
         for i in (0u64..n).step_by(2) {
             assert!(map.remove(&i).is_some());
         }
         assert_eq!(map.len(), (n / 2) as usize);
-        // Remaining half still intact
         for i in (1u64..n).step_by(2) {
             assert!(map.contains_key(&i));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Custom bucket capacity
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bucket_capacity_4() {
+        let mut map: HashMap<u32, u32, RandomState, 4> = HashMap::with_hasher(RandomState::new());
+        for i in 0..500 {
+            map.insert(i, i * 2);
+        }
+        assert_eq!(map.len(), 500);
+        for i in 0..500 {
+            assert_eq!(map[&i], i * 2);
+        }
+    }
+
+    #[test]
+    fn bucket_capacity_16() {
+        let mut map: HashMap<u32, u32, RandomState, 16> = HashMap::with_hasher(RandomState::new());
+        for i in 0..500 {
+            map.insert(i, i * 2);
+        }
+        assert_eq!(map.len(), 500);
+        for i in 0..500 {
+            assert_eq!(map[&i], i * 2);
         }
     }
 
@@ -974,7 +1000,6 @@ mod tests {
         map.insert(1, 10);
         map.entry(1).and_modify(|v| *v += 5).or_insert(0);
         assert_eq!(map[&1], 15);
-
         map.entry(2).and_modify(|v| *v += 5).or_insert(0);
         assert_eq!(map[&2], 0);
     }
@@ -1195,11 +1220,9 @@ mod tests {
 
     #[test]
     fn composite_key_account_order() {
-        // Simulates (AccountId, OrderId) → (Side, Price)
         type AccountId = u32;
         type OrderId = u64;
         let mut map: HashMap<(AccountId, OrderId), (u8, u64)> = HashMap::with_capacity(4096);
-
         for acct in 0..10u32 {
             for oid in 0..100u64 {
                 map.insert((acct, oid), (acct as u8 % 2, oid * 100));
@@ -1213,7 +1236,6 @@ mod tests {
 
     #[test]
     fn composite_key_account_currency() {
-        // Simulates (AccountId, CurrencyId) → Balance { available, reserved }
         let mut map: HashMap<(u32, u32), (u64, u64)> = HashMap::new();
         for acct in 0..100u32 {
             for cur in 0..5u32 {
@@ -1221,8 +1243,6 @@ mod tests {
             }
         }
         assert_eq!(map.len(), 500);
-
-        // Simulate reserve
         let bal = map.get_mut(&(42, 2)).unwrap();
         bal.0 -= 1000;
         bal.1 += 1000;
@@ -1263,7 +1283,6 @@ mod tests {
             map.remove(&i);
         }
         assert!(map.is_empty());
-        // Reinsert — buckets still exist but are empty.
         for i in 0..500 {
             map.insert(i, i + 1);
         }
@@ -1277,13 +1296,13 @@ mod tests {
     fn with_capacity_zero() {
         let map: HashMap<u32, u32> = HashMap::with_capacity(0);
         assert!(map.is_empty());
-        assert!(map.capacity() >= 1); // at least one bucket
+        assert!(map.capacity() >= 1);
     }
 
     #[test]
     fn hasher_accessor() {
         let map: HashMap<u32, u32> = HashMap::new();
-        let _ = map.hasher(); // just verify it compiles and doesn't panic
+        let _ = map.hasher();
     }
 
     #[test]
@@ -1313,9 +1332,6 @@ mod tests {
     // Identity hasher — deterministic control over hash bit patterns
     // -----------------------------------------------------------------------
 
-    /// Hasher that returns the bytes written as-is. For u64 keys this is the
-    /// identity function, giving us full control over which directory slot
-    /// and bucket each key maps to.
     struct IdentityHasher(u64);
 
     impl std::hash::Hasher for IdentityHasher {
@@ -1323,7 +1339,6 @@ mod tests {
             self.0
         }
         fn write(&mut self, bytes: &[u8]) {
-            // Fold bytes into u64 little-endian (sufficient for test keys).
             self.0 = 0;
             for (i, &b) in bytes.iter().enumerate().take(8) {
                 self.0 |= (b as u64) << (i * 8);
@@ -1341,25 +1356,17 @@ mod tests {
         }
     }
 
-    /// Helper: create a map with the identity hasher.
     fn identity_map() -> HashMap<u64, u64, IdentityBuildHasher> {
         HashMap::with_hasher(IdentityBuildHasher)
     }
 
     #[test]
     fn split_distributes_by_next_bit() {
-        // Start with global_depth=0 (1 bucket). Insert 9 keys to force a
-        // split. Keys 0..8 have bit 0 = 0, key 1 has bit 0 = 1. After the
-        // split on bit 0, key 1 should be alone in the sibling bucket.
         let mut map = identity_map();
-
-        // 8 even-numbered keys → all have bit 0 = 0, land in the same bucket.
         for i in 0u64..8 {
             map.insert(i * 2, i);
         }
-        assert_eq!(map.inner.global_depth, 0); // still one bucket, 8 entries
-
-        // 9th insert (odd key) forces a split on bit 0.
+        assert_eq!(map.inner.global_depth, 0);
         map.insert(1, 100);
         assert!(map.inner.global_depth >= 1);
         assert_eq!(map.len(), 9);
@@ -1371,12 +1378,7 @@ mod tests {
 
     #[test]
     fn split_directory_pointers_correct() {
-        // Force multiple splits and verify every key is still reachable.
-        // Keys are chosen to exercise different bit patterns.
         let mut map = identity_map();
-
-        // Insert keys with hashes 0, 1, 2, ..., 63. Each set of 8 keys
-        // sharing the same low bits will fill a bucket and force a split.
         for i in 0u64..64 {
             map.insert(i, i * 7);
         }
@@ -1384,13 +1386,7 @@ mod tests {
         for i in 0u64..64 {
             assert_eq!(map.get(&i), Some(&(i * 7)), "missing key {i}");
         }
-
-        // Verify directory size is a power of two and consistent with
-        // global_depth.
         assert_eq!(map.inner.directory.len(), 1 << map.inner.global_depth);
-
-        // Verify every directory slot points to a valid bucket and that
-        // bucket's local_depth <= global_depth.
         for &bi in &map.inner.directory {
             let bi = bi as usize;
             assert!(bi < map.inner.buckets.len());
@@ -1400,24 +1396,8 @@ mod tests {
 
     #[test]
     fn split_all_same_low_bits_forces_repeated_splits() {
-        // All keys have the same low 3 bits (= 0b101 = 5). This forces the
-        // first 3 splits to produce empty siblings (all entries stay in the
-        // same bucket), driving local_depth up without distributing entries.
-        // Bit 3 finally differs and entries split.
         let mut map = identity_map();
-
-        // Keys: 5, 5+8=13, 5+16=21, ..., 5+56=61 (8 keys, all ≡ 5 mod 8)
-        // Plus 5+4=9 which differs at bit 3 (binary: 5=0101, 9=1001, diff at bit 3).
-        // Wait, 5=0b0101, 13=0b1101. Bit 3 of 5=0, bit 3 of 13=1. So the
-        // first split (on bit 0) separates nothing (all have bit 0 = 1).
-        // Actually: 5=0b101. All keys ≡ 5 mod 8 means bits 0-2 are 101.
-        // Splits on bits 0, 1, 2 produce empty siblings. Split on bit 3
-        // finally separates keys where bit 3 = 0 (e.g. 5=0b0101) from
-        // keys where bit 3 = 1 (e.g. 13=0b1101).
         let keys: Vec<u64> = (0..9).map(|i| 5 + i * 8).collect();
-        // keys = [5, 13, 21, 29, 37, 45, 53, 61, 69]
-        // bit 3: 5=0,13=1,21=0,29=1,37=0,45=1,53=0,61=1,69=0
-
         for &k in &keys {
             map.insert(k, k);
         }
@@ -1429,27 +1409,15 @@ mod tests {
 
     #[test]
     fn targeted_directory_update_with_deep_split() {
-        // Build a map where one bucket has low local_depth while others are
-        // deeper. Insert keys to force global_depth high, then insert into the
-        // lagging bucket to trigger a split that must update multiple
-        // directory slots via the targeted (non-scanning) path.
         let mut map = identity_map();
-
-        // Phase 1: insert 64 keys (0..63) to build up the directory.
         for i in 0u64..64 {
             map.insert(i, i);
         }
         let gd_after_phase1 = map.inner.global_depth;
-
-        // Phase 2: insert 200 more keys in a range that exercises further
-        // splits. After this, global_depth should be well above the
-        // local_depth of some buckets.
         for i in 64u64..264 {
             map.insert(i, i);
         }
         assert_eq!(map.len(), 264);
-
-        // Verify all keys are retrievable (the core correctness check).
         for i in 0u64..264 {
             assert_eq!(
                 map.get(&i),
@@ -1458,8 +1426,6 @@ mod tests {
                 map.inner.global_depth
             );
         }
-
-        // Verify structural invariants.
         let dir_size = map.inner.directory.len();
         assert_eq!(dir_size, 1 << map.inner.global_depth);
         for slot in 0..dir_size {
@@ -1475,8 +1441,6 @@ mod tests {
                 bucket.local_depth,
                 map.inner.global_depth
             );
-            // Every entry in this bucket should hash to this directory slot
-            // (modulo the bucket's local_depth mask).
             let local_mask = (1usize << bucket.local_depth) - 1;
             for i in 0..bucket.len() {
                 let hash = bucket.hashes[i];
@@ -1492,8 +1456,6 @@ mod tests {
 
     #[test]
     fn all_entries_counted_once_via_bucket_pool() {
-        // Verify that iterating the bucket pool visits each entry exactly
-        // once, even with aliased directory entries.
         let mut map = identity_map();
         for i in 0u64..500 {
             map.insert(i, i);
@@ -1501,8 +1463,6 @@ mod tests {
         let iter_count = map.iter().count();
         assert_eq!(iter_count, 500);
         assert_eq!(iter_count, map.len());
-
-        // Verify via bucket pool directly.
         let pool_count: usize = map.inner.buckets.iter().map(|b| b.len()).sum();
         assert_eq!(pool_count, 500);
     }

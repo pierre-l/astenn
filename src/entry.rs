@@ -1,26 +1,27 @@
+use crate::DEFAULT_BUCKET_CAPACITY;
 use crate::map::HashMapInner;
 
 /// A view into a single entry in a map, which may be either vacant or
 /// occupied. This is constructed via [`HashMap::entry`].
-pub enum Entry<'a, K, V> {
+pub enum Entry<'a, K, V, const N: usize = DEFAULT_BUCKET_CAPACITY> {
     /// An occupied entry.
-    Occupied(OccupiedEntry<'a, K, V>),
+    Occupied(OccupiedEntry<'a, K, V, N>),
     /// A vacant entry.
-    Vacant(VacantEntry<'a, K, V>),
+    Vacant(VacantEntry<'a, K, V, N>),
 }
 
 /// A view into an occupied entry in a `HashMap`. It is part of the
 /// [`Entry`] enum.
-pub struct OccupiedEntry<'a, K, V> {
-    inner: &'a mut HashMapInner<K, V>,
+pub struct OccupiedEntry<'a, K, V, const N: usize = DEFAULT_BUCKET_CAPACITY> {
+    inner: &'a mut HashMapInner<K, V, N>,
     bucket_idx: usize,
     entry_idx: usize,
 }
 
 /// A view into a vacant entry in a `HashMap`. It is part of the
 /// [`Entry`] enum.
-pub struct VacantEntry<'a, K, V> {
-    inner: &'a mut HashMapInner<K, V>,
+pub struct VacantEntry<'a, K, V, const N: usize = DEFAULT_BUCKET_CAPACITY> {
+    inner: &'a mut HashMapInner<K, V, N>,
     key: K,
     hash: u64,
 }
@@ -29,7 +30,7 @@ pub struct VacantEntry<'a, K, V> {
 // Entry
 // ---------------------------------------------------------------------------
 
-impl<'a, K: Eq, V> Entry<'a, K, V> {
+impl<'a, K: Eq, V, const N: usize> Entry<'a, K, V, N> {
     /// Ensures a value is in the entry by inserting the default if empty, and
     /// returns a mutable reference to the value in the entry.
     #[inline]
@@ -84,7 +85,7 @@ impl<'a, K: Eq, V> Entry<'a, K, V> {
     }
 }
 
-impl<'a, K: Eq, V: Default> Entry<'a, K, V> {
+impl<'a, K: Eq, V: Default, const N: usize> Entry<'a, K, V, N> {
     /// Ensures a value is in the entry by inserting the default value if
     /// empty, and returns a mutable reference to the value.
     #[inline]
@@ -97,9 +98,9 @@ impl<'a, K: Eq, V: Default> Entry<'a, K, V> {
 // OccupiedEntry
 // ---------------------------------------------------------------------------
 
-impl<'a, K, V> OccupiedEntry<'a, K, V> {
+impl<'a, K, V, const N: usize> OccupiedEntry<'a, K, V, N> {
     pub(crate) fn new(
-        inner: &'a mut HashMapInner<K, V>,
+        inner: &'a mut HashMapInner<K, V, N>,
         bucket_idx: usize,
         entry_idx: usize,
     ) -> Self {
@@ -171,8 +172,8 @@ impl<'a, K, V> OccupiedEntry<'a, K, V> {
 // VacantEntry
 // ---------------------------------------------------------------------------
 
-impl<'a, K: Eq, V> VacantEntry<'a, K, V> {
-    pub(crate) fn new(inner: &'a mut HashMapInner<K, V>, key: K, hash: u64) -> Self {
+impl<'a, K: Eq, V, const N: usize> VacantEntry<'a, K, V, N> {
+    pub(crate) fn new(inner: &'a mut HashMapInner<K, V, N>, key: K, hash: u64) -> Self {
         Self { inner, key, hash }
     }
 
