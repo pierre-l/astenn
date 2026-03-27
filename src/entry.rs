@@ -156,7 +156,7 @@ impl<'a, K, V, const N: usize> OccupiedEntry<'a, K, V, N> {
     /// Takes ownership of the key and value from the map.
     #[inline]
     pub fn remove_entry(self) -> (K, V) {
-        let (_, k, v) = self.inner.buckets[self.bucket_idx].swap_remove(self.entry_idx);
+        let (k, v) = self.inner.buckets[self.bucket_idx].swap_remove(self.entry_idx);
         self.inner.len -= 1;
         (k, v)
     }

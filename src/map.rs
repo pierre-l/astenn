@@ -9,54 +9,76 @@ use crate::DEFAULT_BUCKET_CAPACITY;
 use crate::entry::{Entry, OccupiedEntry, VacantEntry};
 use crate::iter::{Drain, IntoIter, Iter, IterMut, Keys, Values, ValuesMut};
 
-/// Maximum local depth — bounded by the number of usable bits in a u64 hash.
-/// Once a bucket reaches this depth, further splits cannot redistribute
-/// entries. With a good hash function (FxHash, SipHash), 8+ keys sharing
-/// the same 64-bit hash is astronomically unlikely.
-const MAX_LOCAL_DEPTH: u8 = 64;
+/// Maximum local depth — bounded by the 32 low-order hash bits stored per
+/// entry for split redistribution. 2^32 directory slots × N entries per
+/// bucket far exceeds any realistic workload.
+const MAX_LOCAL_DEPTH: u8 = 32;
+
+/// Extract a non-zero fingerprint from the upper bits of a hash.
+///
+/// Uses bits 56–63 (independent of the directory's low-bit routing) and
+/// forces bit 0 on so the result is **never zero**. Zero is reserved as
+/// the "empty slot" sentinel, letting [`HashMapInner::find`] skip the
+/// `len` read entirely on the scan path.
+#[inline(always)]
+fn fingerprint(hash: u64) -> u8 {
+    (hash >> 56) as u8 | 1
+}
 
 // ---------------------------------------------------------------------------
 // Bucket — inline storage, struct-of-arrays layout
 // ---------------------------------------------------------------------------
 
 /// A single bucket in the extendible hash table. Entries are stored **inline**
-/// (not heap-allocated) for cache locality: the hash array and key-value array
-/// are contiguous in memory with the bucket metadata.
+/// (not heap-allocated) for cache locality.
 ///
-/// `repr(C, align(64))` guarantees the hash array starts at offset 0 — the
-/// beginning of a cache line. A lookup scans only this array before touching
-/// any keys or values, so the common case (no match) never reads beyond the
-/// hash data.
+/// `repr(C, align(64))` guarantees the fingerprint array starts at offset 0 —
+/// the beginning of a cache line. A lookup scans only this 8-byte array
+/// (for the default N=8) before touching any keys or values, so the common
+/// case (no match) reads just **one cache line**.
+///
+/// ## Layout (N = 8, representative KV types)
+///
+/// ```text
+/// cache line 0:  fingerprints[8] + len + depth + pad + hash_low[8] + entries[0]…
+/// cache line 1+: remaining entries
+/// ```
 ///
 /// The const generic `N` controls the number of entries per bucket. The
-/// default (8) places the hash array at exactly one cache line (64 bytes).
-/// Smaller values (e.g. 4) reduce per-lookup scan cost and bucket pool
-/// footprint at the expense of more frequent splits.
+/// default (8) keeps the fingerprint array at 8 bytes—tiny compared to
+/// the 64-byte hash array in the previous design—while `hash_low` stores
+/// the 32 low-order hash bits needed for bucket splits.
 ///
 /// Multiple directory slots may point to the same bucket when
 /// `local_depth < global_depth`.
 #[repr(C, align(64))]
 pub(crate) struct Bucket<K, V, const N: usize> {
-    /// Hash values, indexed `0..len`. **First field** so it sits at the
-    /// cache-line-aligned start of the struct.
-    pub(crate) hashes: [u64; N],
+    /// Non-zero fingerprints for fast scan, indexed `0..len`. Derived from
+    /// the upper 8 bits of each entry's hash (`(hash >> 56) | 1`). Slots
+    /// beyond `len` are zero — the sentinel value that never matches any
+    /// fingerprint, so `find` can skip the `len` read entirely.
+    pub(crate) fingerprints: [u8; N],
+    /// Number of initialized entries. Invariant: `len <= N`.
+    pub(crate) len: u8,
+    pub(crate) local_depth: u8,
+    /// Lower 32 bits of each entry's hash. Used during bucket splits to
+    /// determine which sibling an entry belongs to. 32 bits supports up to
+    /// 2^32 directory slots—far beyond any realistic workload.
+    pub(crate) hash_low: [u32; N],
     /// Key-value pairs, indexed `0..len`. Only `entries[0..len]` are
     /// initialized; the rest are `MaybeUninit`.
     pub(crate) entries: [MaybeUninit<(K, V)>; N],
-    pub(crate) local_depth: u8,
-    /// Number of initialized entries in `hashes` and `entries`. Invariant:
-    /// `len <= N`.
-    pub(crate) len: u8,
 }
 
 impl<K, V, const N: usize> Bucket<K, V, N> {
     fn new(local_depth: u8) -> Self {
         Self {
-            hashes: [0; N],
+            fingerprints: [0; N],
+            len: 0,
+            local_depth,
+            hash_low: [0; N],
             // SAFETY: An array of MaybeUninit doesn't require initialization.
             entries: [const { MaybeUninit::uninit() }; N],
-            local_depth,
-            len: 0,
         }
     }
 
@@ -68,32 +90,33 @@ impl<K, V, const N: usize> Bucket<K, V, N> {
     /// Push a new entry. The caller must ensure the bucket is not full
     /// (enforced by the split-before-insert loop in `insert_entry`).
     #[inline]
-    fn push(&mut self, hash: u64, key: K, value: V) {
+    fn push(&mut self, fp: u8, hash_low: u32, key: K, value: V) {
         let idx = self.len as usize;
         debug_assert!(
             idx < N,
             "bucket overflow at local_depth={}",
             self.local_depth
         );
-        self.hashes[idx] = hash;
+        self.fingerprints[idx] = fp;
+        self.hash_low[idx] = hash_low;
         self.entries[idx].write((key, value));
         self.len += 1;
     }
 
     /// Remove the entry at `idx` by swapping it with the last entry.
-    /// Returns the removed `(hash, key, value)`.
-    pub(crate) fn swap_remove(&mut self, idx: usize) -> (u64, K, V) {
+    /// Returns the removed `(key, value)`.
+    pub(crate) fn swap_remove(&mut self, idx: usize) -> (K, V) {
         debug_assert!(idx < self.len as usize);
         let last = (self.len - 1) as usize;
 
-        let hash = self.hashes[idx];
         // SAFETY: `idx < len`, so `entries[idx]` is initialized. `assume_init_read`
         // copies the value out without dropping the source (we overwrite it below
         // or leave it as the now-uninit last slot).
         let (key, value) = unsafe { self.entries[idx].assume_init_read() };
 
         if idx != last {
-            self.hashes[idx] = self.hashes[last];
+            self.fingerprints[idx] = self.fingerprints[last];
+            self.hash_low[idx] = self.hash_low[last];
             // SAFETY: `last < len` (old len), so `entries[last]` is initialized.
             // Move it into the vacated slot; `entries[last]` becomes uninit.
             unsafe {
@@ -101,8 +124,10 @@ impl<K, V, const N: usize> Bucket<K, V, N> {
             }
         }
 
+        // Clear the vacated slot's fingerprint — zero is the "empty" sentinel.
+        self.fingerprints[last] = 0;
         self.len -= 1;
-        (hash, key, value)
+        (key, value)
     }
 
     /// Return a slice over the initialized key-value pairs.
@@ -129,6 +154,8 @@ impl<K, V, const N: usize> Bucket<K, V, N> {
             }
         }
         self.len = 0;
+        // Zero fingerprints so the sentinel invariant holds (0 = empty slot).
+        self.fingerprints = [0; N];
     }
 }
 
@@ -149,7 +176,7 @@ impl<K: Clone, V: Clone, const N: usize> Clone for Bucket<K, V, N> {
         for i in 0..self.len as usize {
             // SAFETY: `i < len`, so `entries[i]` is initialized.
             let (k, v) = unsafe { self.entries[i].assume_init_ref() };
-            new.push(self.hashes[i], k.clone(), v.clone());
+            new.push(self.fingerprints[i], self.hash_low[i], k.clone(), v.clone());
         }
         new
     }
@@ -201,9 +228,13 @@ impl<K: Eq, V, const N: usize> HashMapInner<K, V, N> {
     /// Hot-path optimizations:
     /// - `get_unchecked` on directory and bucket access (indices are always
     ///   valid — `dir_idx` is masked, `bucket_idx` comes from our directory).
-    /// - Fixed-iteration hash scan: all `N` hashes are compared
-    ///   unconditionally, then invalid slots are masked out. The fixed trip
-    ///   count enables the compiler to unroll/vectorize the loop.
+    /// - **Fingerprint scan**: compares N single-byte fingerprints instead
+    ///   of N full u64 hashes — 8× less data touched (8 bytes vs 64 for
+    ///   the default N=8), fitting in a single register load.
+    /// - **Sentinel-based empty detection**: fingerprints are always non-zero
+    ///   (`(hash >> 56) | 1`); empty slots hold zero. A lookup that misses
+    ///   never reads `len` — it only touches the fingerprint array (first
+    ///   cache line), avoiding a separate cache-line load.
     #[inline]
     fn find<Q>(&self, hash: u64, key: &Q) -> Option<(usize, usize)>
     where
@@ -217,27 +248,26 @@ impl<K: Eq, V, const N: usize> HashMapInner<K, V, N> {
         // SAFETY: all directory entries are valid bucket pool indices,
         // maintained by `with_capacity_and_hasher` and `split_bucket`.
         let bucket = unsafe { self.buckets.get_unchecked(bucket_idx) };
-        let len = bucket.len();
 
-        // Fixed-iteration scan: compare all N hashes against the target.
-        // `hashes` is a plain `[u64; N]` (not MaybeUninit), so reading all
-        // slots is safe even beyond `len` — they hold 0 or stale values.
-        // The fixed trip count lets the compiler unroll this into branchless
-        // straight-line code.
+        let fp = fingerprint(hash);
+
+        // Fixed-iteration fingerprint scan. Empty slots have fingerprint 0,
+        // and `fp` is always non-zero (bit 0 forced on), so empty slots
+        // never match — no need to mask by `len`. The fixed trip count lets
+        // the compiler unroll this into branchless straight-line code.
         let mut match_bits: u32 = 0;
         for i in 0..N {
-            if unsafe { *bucket.hashes.get_unchecked(i) } == hash {
+            if unsafe { *bucket.fingerprints.get_unchecked(i) } == fp {
                 match_bits |= 1 << i;
             }
         }
-        // Clear bits for uninitialized entries (i >= len).
-        match_bits &= (1u32 << len) - 1;
 
         // Iterate only the matching positions (usually 0 or 1).
         while match_bits != 0 {
             let i = match_bits.trailing_zeros() as usize;
             match_bits &= match_bits - 1; // clear lowest set bit
-            // SAFETY: `i < len` because we masked out bits >= len above.
+            // SAFETY: `i` had a non-zero fingerprint, so it is an occupied
+            // slot (`i < len`).
             let (k, _) = unsafe { bucket.entries.get_unchecked(i).assume_init_ref() };
             if k.borrow() == key {
                 return Some((bucket_idx, i));
@@ -249,17 +279,21 @@ impl<K: Eq, V, const N: usize> HashMapInner<K, V, N> {
     /// Insert a new entry (caller guarantees key is absent). Returns the
     /// `(bucket_pool_idx, entry_idx)` where the entry landed.
     pub(crate) fn insert_entry(&mut self, hash: u64, key: K, value: V) -> (usize, usize) {
+        let fp = fingerprint(hash);
+        let hl = hash as u32;
         loop {
             let dir_idx = self.dir_index(hash);
             // SAFETY: same as `find` — dir_idx is masked, directory entries
             // are valid bucket indices.
             let bucket_pool_idx = unsafe { *self.directory.get_unchecked(dir_idx) } as usize;
+            // SAFETY: all directory entries are valid bucket pool indices.
+            let bucket = unsafe { self.buckets.get_unchecked(bucket_pool_idx) };
 
-            if self.buckets[bucket_pool_idx].len() < N
-                || self.buckets[bucket_pool_idx].local_depth >= MAX_LOCAL_DEPTH
-            {
-                let entry_idx = self.buckets[bucket_pool_idx].len();
-                self.buckets[bucket_pool_idx].push(hash, key, value);
+            if bucket.len() < N || bucket.local_depth >= MAX_LOCAL_DEPTH {
+                // SAFETY: same index, now mutable.
+                let bucket = unsafe { self.buckets.get_unchecked_mut(bucket_pool_idx) };
+                let entry_idx = bucket.len();
+                bucket.push(fp, hl, key, value);
                 self.len += 1;
                 return (bucket_pool_idx, entry_idx);
             }
@@ -288,7 +322,7 @@ impl<K: Eq, V, const N: usize> HashMapInner<K, V, N> {
         // `old_depth` bits of any entry's hash identify which directory
         // slots map to this bucket — we use this to target the update.
         let base_pattern =
-            self.buckets[bucket_pool_idx].hashes[0] as usize & ((1usize << old_depth) - 1);
+            self.buckets[bucket_pool_idx].hash_low[0] as usize & ((1usize << old_depth) - 1);
 
         // Double the directory if the bucket's new depth exceeds global depth.
         // `extend_from_within` compiles to a single memcpy.
@@ -306,12 +340,14 @@ impl<K: Eq, V, const N: usize> HashMapInner<K, V, N> {
 
         // Collect entries from the old bucket into a stack-allocated buffer.
         // No heap allocation — N is small (typically 4-8).
-        let bit = 1u64 << old_depth;
+        let bit = 1u32 << old_depth;
         let n = self.buckets[bucket_pool_idx].len();
-        let mut hashes_buf = [0u64; N];
+        let mut fps_buf = [0u8; N];
+        let mut hash_low_buf = [0u32; N];
         let mut entries_buf: [MaybeUninit<(K, V)>; N] = [const { MaybeUninit::uninit() }; N];
         for i in 0..n {
-            hashes_buf[i] = self.buckets[bucket_pool_idx].hashes[i];
+            fps_buf[i] = self.buckets[bucket_pool_idx].fingerprints[i];
+            hash_low_buf[i] = self.buckets[bucket_pool_idx].hash_low[i];
             // SAFETY: `i < len`, so `entries[i]` is initialized. `assume_init_read`
             // copies the value; we reset `len = 0` below so the bucket won't
             // double-drop.
@@ -319,18 +355,21 @@ impl<K: Eq, V, const N: usize> HashMapInner<K, V, N> {
                 .write(unsafe { self.buckets[bucket_pool_idx].entries[i].assume_init_read() });
         }
         self.buckets[bucket_pool_idx].len = 0;
+        // Clear fingerprints so the sentinel invariant holds (0 = empty).
+        self.buckets[bucket_pool_idx].fingerprints = [0; N];
 
         // Redistribute entries based on the distinguishing bit at position
-        // `old_depth` (0-indexed from LSB).
+        // `old_depth` (0-indexed from LSB) of the stored hash_low.
         for i in 0..n {
-            let hash = hashes_buf[i];
+            let hl = hash_low_buf[i];
+            let fp = fps_buf[i];
             // SAFETY: `entries_buf[i]` was initialized in the loop above for
             // all `i < n`.
             let (key, value) = unsafe { entries_buf[i].assume_init_read() };
-            if hash & bit != 0 {
-                self.buckets[new_bucket_idx].push(hash, key, value);
+            if hl & bit != 0 {
+                self.buckets[new_bucket_idx].push(fp, hl, key, value);
             } else {
-                self.buckets[bucket_pool_idx].push(hash, key, value);
+                self.buckets[bucket_pool_idx].push(fp, hl, key, value);
             }
         }
 
@@ -562,8 +601,19 @@ impl<K: Eq + Hash, V, S: BuildHasher, const N: usize> HashMap<K, V, S, N> {
     {
         let hash = self.hash_key(key);
         let (bi, ei) = self.inner.find(hash, key)?;
-        // SAFETY: `find` guarantees `ei < bucket.len()`.
-        Some(&unsafe { self.inner.buckets[bi].entries[ei].assume_init_ref() }.1)
+        // SAFETY: `find` guarantees `bi` is a valid bucket index and
+        // `ei < bucket.len()`.
+        Some(
+            &unsafe {
+                self.inner
+                    .buckets
+                    .get_unchecked(bi)
+                    .entries
+                    .get_unchecked(ei)
+                    .assume_init_ref()
+            }
+            .1,
+        )
     }
 
     /// Returns the key-value pair corresponding to the supplied key.
@@ -575,8 +625,15 @@ impl<K: Eq + Hash, V, S: BuildHasher, const N: usize> HashMap<K, V, S, N> {
     {
         let hash = self.hash_key(key);
         let (bi, ei) = self.inner.find(hash, key)?;
-        // SAFETY: `find` guarantees `ei < bucket.len()`.
-        let (k, v) = unsafe { self.inner.buckets[bi].entries[ei].assume_init_ref() };
+        // SAFETY: `find` guarantees valid indices.
+        let (k, v) = unsafe {
+            self.inner
+                .buckets
+                .get_unchecked(bi)
+                .entries
+                .get_unchecked(ei)
+                .assume_init_ref()
+        };
         Some((k, v))
     }
 
@@ -589,8 +646,18 @@ impl<K: Eq + Hash, V, S: BuildHasher, const N: usize> HashMap<K, V, S, N> {
     {
         let hash = self.hash_key(key);
         let (bi, ei) = self.inner.find(hash, key)?;
-        // SAFETY: `find` guarantees `ei < bucket.len()`.
-        Some(&mut unsafe { self.inner.buckets[bi].entries[ei].assume_init_mut() }.1)
+        // SAFETY: `find` guarantees valid indices.
+        Some(
+            &mut unsafe {
+                self.inner
+                    .buckets
+                    .get_unchecked_mut(bi)
+                    .entries
+                    .get_unchecked_mut(ei)
+                    .assume_init_mut()
+            }
+            .1,
+        )
     }
 
     /// Returns `true` if the map contains a value for the specified key.
@@ -611,8 +678,15 @@ impl<K: Eq + Hash, V, S: BuildHasher, const N: usize> HashMap<K, V, S, N> {
 
         // If the key already exists, overwrite in place.
         if let Some((bi, ei)) = self.inner.find(hash, &key) {
-            // SAFETY: `find` guarantees `ei < bucket.len()`.
-            let entry = unsafe { self.inner.buckets[bi].entries[ei].assume_init_mut() };
+            // SAFETY: `find` guarantees valid indices.
+            let entry = unsafe {
+                self.inner
+                    .buckets
+                    .get_unchecked_mut(bi)
+                    .entries
+                    .get_unchecked_mut(ei)
+                    .assume_init_mut()
+            };
             let old = std::mem::replace(&mut entry.1, value);
             return Some(old);
         }
@@ -640,8 +714,9 @@ impl<K: Eq + Hash, V, S: BuildHasher, const N: usize> HashMap<K, V, S, N> {
     {
         let hash = self.hash_key(key);
         let (bi, ei) = self.inner.find(hash, key)?;
+        // SAFETY: `find` guarantees `bi` is a valid bucket index.
         // swap_remove is O(1) and order within a bucket is irrelevant.
-        let (_, k, v) = self.inner.buckets[bi].swap_remove(ei);
+        let (k, v) = unsafe { self.inner.buckets.get_unchecked_mut(bi) }.swap_remove(ei);
         self.inner.len -= 1;
         Some((k, v))
     }
@@ -1443,11 +1518,11 @@ mod tests {
             );
             let local_mask = (1usize << bucket.local_depth) - 1;
             for i in 0..bucket.len() {
-                let hash = bucket.hashes[i];
+                let hash_low = bucket.hash_low[i];
                 assert_eq!(
-                    hash as usize & local_mask,
+                    hash_low as usize & local_mask,
                     slot & local_mask,
-                    "entry with hash {hash:#x} in bucket {bi} (slot {slot}) violates local_depth {} prefix",
+                    "entry with hash_low {hash_low:#x} in bucket {bi} (slot {slot}) violates local_depth {} prefix",
                     bucket.local_depth
                 );
             }
