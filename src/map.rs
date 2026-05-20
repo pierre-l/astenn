@@ -197,11 +197,19 @@ pub(crate) struct HashMapInner<K, V, const N: usize = DEFAULT_BUCKET_CAPACITY> {
     /// realistic workload.
     pub(crate) directory: Vec<u32>,
 
-    /// Pool of buckets. Each bucket appears exactly once; the directory
-    /// references buckets by their index in this vec. Buckets are never
-    /// removed (no merge on delete) — this keeps the pool dense and avoids
-    /// index invalidation.
+    /// Pool of buckets. Each bucket appears at most once in the directory;
+    /// the directory references buckets by their index in this vec. Indices
+    /// in `freelist` are not referenced by the directory and are reused by
+    /// the next `split_bucket` instead of growing the pool.
     pub(crate) buckets: Vec<Bucket<K, V, N>>,
+
+    /// Indices of bucket slots in `buckets` that have been merged away and
+    /// are no longer referenced by the directory. `split_bucket` pops from
+    /// here before growing the pool; without this, high-churn workloads
+    /// (insert-then-delete cycles with unique keys) would leak pool
+    /// capacity as new splits keep pushing fresh buckets while merged
+    /// ones sit unused.
+    pub(crate) freelist: Vec<u32>,
 
     pub(crate) global_depth: u8,
 
@@ -333,9 +341,21 @@ impl<K: Eq, V, const N: usize> HashMapInner<K, V, N> {
             self.mask = self.directory.len() - 1;
         }
 
-        // Create the sibling bucket.
-        let new_bucket_idx = self.buckets.len();
-        self.buckets.push(Bucket::new(new_depth));
+        // Create the sibling bucket — reuse a merged-away slot if one is
+        // available so high-churn workloads don't leak pool capacity.
+        let new_bucket_idx = if let Some(idx) = self.freelist.pop() {
+            let idx = idx as usize;
+            // Reset the recycled bucket. Invariants the freelist guarantees:
+            // len == 0, fingerprints all zero (no double-drop, no false fp
+            // matches on lookup). Setting local_depth completes the reset.
+            debug_assert_eq!(self.buckets[idx].len, 0, "freed bucket must be empty");
+            self.buckets[idx].local_depth = new_depth;
+            idx
+        } else {
+            let idx = self.buckets.len();
+            self.buckets.push(Bucket::new(new_depth));
+            idx
+        };
         self.buckets[bucket_pool_idx].local_depth = new_depth;
 
         // Collect entries from the old bucket into a stack-allocated buffer.
@@ -394,6 +414,134 @@ impl<K: Eq, V, const N: usize> HashMapInner<K, V, N> {
             slot += step;
         }
     }
+
+    /// Try to merge the bucket at `bucket_pool_idx` with its sibling. Called
+    /// from `remove_entry` after a deletion. Two siblings can merge when they
+    /// both sit at the same `local_depth` and their combined entry count fits
+    /// in a single bucket — extendible hashing's symmetric counterpart to
+    /// [`Self::split_bucket`]. Without this path, the bucket pool grows
+    /// monotonically under high-churn workloads (insert/delete cycles with
+    /// unique keys) as new inserts keep triggering splits while earlier
+    /// removes leave previously-split buckets empty.
+    ///
+    /// `hash` is the hash of the just-removed key — used to locate the
+    /// sibling without scanning. We deliberately do NOT shrink the directory
+    /// even when global_depth could be decremented; the directory is 4 bytes
+    /// per slot and the shrink would require scanning all buckets for the
+    /// new max local_depth. Bucket-pool reclamation (where the KV data lives)
+    /// is the load-bearing win; directory shrink is cosmetic.
+    ///
+    /// Cost:
+    /// - Sibling lookup: O(1) (one directory read)
+    /// - Entry move: O(N) (bucket capacity, small constant)
+    /// - Directory pointer update: O(2^(global_depth - local_depth)),
+    ///   same shape as split's targeted update
+    #[cold]
+    fn try_merge_bucket(&mut self, bucket_pool_idx: usize, hash: u64) {
+        let bucket_local_depth = self.buckets[bucket_pool_idx].local_depth;
+        if bucket_local_depth == 0 {
+            // depth-0 bucket is the only one; nothing to merge with.
+            return;
+        }
+
+        // The sibling sits at the directory slot whose distinguishing bit
+        // (position `local_depth - 1`) is flipped vs our bucket's pattern.
+        // We need only the low `local_depth` bits of `hash` to locate it.
+        let d = bucket_local_depth as usize;
+        let bucket_pattern = (hash as usize) & ((1usize << d) - 1);
+        let sibling_pattern = bucket_pattern ^ (1usize << (d - 1));
+        let sibling_dir_idx = sibling_pattern;
+        // SAFETY: sibling_pattern < 2^d <= 2^global_depth = directory.len(),
+        // and all directory entries are valid bucket pool indices.
+        let sibling_pool_idx = unsafe { *self.directory.get_unchecked(sibling_dir_idx) } as usize;
+
+        if sibling_pool_idx == bucket_pool_idx {
+            // Same bucket — this happens only if our state is corrupt
+            // (local_depth out of sync with directory). Be defensive.
+            return;
+        }
+
+        // Sibling must also be at depth `d`. If it's deeper, it was split
+        // further and merge would violate the depth invariant. (It can't be
+        // shallower than `d` and still be a sibling at this level.)
+        let sibling_depth = self.buckets[sibling_pool_idx].local_depth;
+        if sibling_depth != bucket_local_depth {
+            return;
+        }
+
+        // Hysteresis threshold: merge only when the combined load is at
+        // most N/2 (half-full after merge). With the naive `> N` threshold,
+        // a workload that oscillates around a bucket's split boundary
+        // (insert→split→remove→merge→insert→split→...) pays two structural
+        // reorganisations per cycle; each merge is O(2^(global_depth -
+        // local_depth)) directory writes, which dominates throughput on
+        // deep directories. Requiring 50% headroom after merge means a
+        // subsequent split needs at least N/2 + 1 inserts before firing —
+        // amortising the merge cost over many operations.
+        let bucket_len = self.buckets[bucket_pool_idx].len();
+        let sibling_len = self.buckets[sibling_pool_idx].len();
+        if bucket_len + sibling_len > N / 2 {
+            return;
+        }
+
+        // Move sibling's entries into a stack buffer first to avoid a
+        // double mutable borrow on `self.buckets` during the push loop —
+        // same pattern as `split_bucket`.
+        let mut fps_buf = [0u8; N];
+        let mut hash_low_buf = [0u32; N];
+        let mut entries_buf: [MaybeUninit<(K, V)>; N] = [const { MaybeUninit::uninit() }; N];
+        for i in 0..sibling_len {
+            fps_buf[i] = self.buckets[sibling_pool_idx].fingerprints[i];
+            hash_low_buf[i] = self.buckets[sibling_pool_idx].hash_low[i];
+            // SAFETY: `i < sibling_len`, so `entries[i]` is initialized.
+            // We zero `len` and `fingerprints` below so sibling won't
+            // double-drop the moved-out values.
+            entries_buf[i]
+                .write(unsafe { self.buckets[sibling_pool_idx].entries[i].assume_init_read() });
+        }
+        // Sibling is now logically empty. Reset state to satisfy the
+        // freelist invariant: empty bucket with zeroed fingerprints so
+        // future reuse via `split_bucket` starts from a clean slate and
+        // no false fingerprint matches can fire during `find` (which
+        // would walk through this freed bucket otherwise, but only via
+        // the directory — which we update below to stop pointing here).
+        self.buckets[sibling_pool_idx].len = 0;
+        self.buckets[sibling_pool_idx].fingerprints = [0; N];
+
+        // Push sibling's entries into the surviving bucket.
+        for i in 0..sibling_len {
+            // SAFETY: `entries_buf[i]` was initialized in the loop above
+            // for all `i < sibling_len`.
+            let (k, v) = unsafe { entries_buf[i].assume_init_read() };
+            self.buckets[bucket_pool_idx].push(fps_buf[i], hash_low_buf[i], k, v);
+        }
+
+        // Surviving bucket's local_depth drops by 1; it now covers both
+        // halves of the previous sibling pair.
+        self.buckets[bucket_pool_idx].local_depth = bucket_local_depth - 1;
+
+        // Targeted directory update: every slot whose low `d` bits match
+        // `sibling_pattern` currently points at the sibling — redirect
+        // them to the surviving bucket. Same stride pattern as split's
+        // post-split fixup.
+        let surviving_u32 = bucket_pool_idx as u32;
+        let sibling_u32 = sibling_pool_idx as u32;
+        let stride = 1usize << d;
+        let dir_size = self.directory.len();
+        let mut slot = sibling_pattern;
+        while slot < dir_size {
+            debug_assert_eq!(
+                self.directory[slot], sibling_u32,
+                "directory slot {slot} should point to sibling bucket {sibling_pool_idx} but points to {}",
+                self.directory[slot]
+            );
+            self.directory[slot] = surviving_u32;
+            slot += stride;
+        }
+
+        // Recycle sibling's pool slot.
+        self.freelist.push(sibling_u32);
+    }
 }
 
 impl<K: Clone, V: Clone, const N: usize> Clone for HashMapInner<K, V, N> {
@@ -401,6 +549,7 @@ impl<K: Clone, V: Clone, const N: usize> Clone for HashMapInner<K, V, N> {
         Self {
             directory: self.directory.clone(),
             buckets: self.buckets.clone(),
+            freelist: self.freelist.clone(),
             global_depth: self.global_depth,
             mask: self.mask,
             len: self.len,
@@ -500,6 +649,7 @@ impl<K, V, S, const N: usize> HashMap<K, V, S, N> {
             inner: HashMapInner {
                 directory,
                 buckets,
+                freelist: Vec::new(),
                 global_depth,
                 mask: dir_size - 1,
                 len: 0,
@@ -718,6 +868,11 @@ impl<K: Eq + Hash, V, S: BuildHasher, const N: usize> HashMap<K, V, S, N> {
         // swap_remove is O(1) and order within a bucket is irrelevant.
         let (k, v) = unsafe { self.inner.buckets.get_unchecked_mut(bi) }.swap_remove(ei);
         self.inner.len -= 1;
+        // Symmetric to split-on-overflow: attempt to merge with the sibling
+        // if both buckets are now sparse enough to fit in one. Bounds the
+        // directory under high-churn workloads where unique-key inserts and
+        // matching deletes would otherwise grow the bucket pool unbounded.
+        self.inner.try_merge_bucket(bi, hash);
         Some((k, v))
     }
 
@@ -1540,5 +1695,154 @@ mod tests {
         assert_eq!(iter_count, map.len());
         let pool_count: usize = map.inner.buckets.iter().map(|b| b.len()).sum();
         assert_eq!(pool_count, 500);
+    }
+
+    /// Inserting enough to force splits, then removing all entries, should
+    /// drain entries (`len` goes to 0) AND recycle the now-empty buckets
+    /// onto the freelist so the pool's live bucket count returns toward
+    /// the initial allocation. Without merge, the pool monotonically
+    /// grows even when the map is empty.
+    #[test]
+    fn merge_after_full_drain_recycles_buckets() {
+        let mut map = HashMap::new();
+        // Insert enough to cause many splits.
+        for i in 0u64..1000 {
+            map.insert(i, i);
+        }
+        let live_buckets_before_remove = map.inner.buckets.len() - map.inner.freelist.len();
+        assert!(
+            live_buckets_before_remove > 1,
+            "expected splits to have grown the pool, got {} live buckets",
+            live_buckets_before_remove,
+        );
+
+        for i in 0u64..1000 {
+            map.remove(&i);
+        }
+        assert_eq!(map.len(), 0);
+
+        // After draining, the freelist should hold most of what splits
+        // allocated — only a small constant (1-2) of live buckets should
+        // remain in the directory.
+        let live_buckets_after_remove = map.inner.buckets.len() - map.inner.freelist.len();
+        assert!(
+            live_buckets_after_remove <= 2,
+            "expected merge to recycle buckets, but {} are still live",
+            live_buckets_after_remove,
+        );
+    }
+
+    /// Under a high-churn workload (each key inserted then removed once,
+    /// with unique keys), the bucket pool should stay bounded — the
+    /// classic motivating case for merge. Without it, the pool grows in
+    /// proportion to total inserts, not live count.
+    #[test]
+    fn merge_bounds_pool_under_high_churn() {
+        let mut map = HashMap::new();
+        // 100 cycles of "insert a batch, then delete that batch" with
+        // unique keys per cycle. Total inserts = 10,000; live count
+        // stays at most ~100 at any moment.
+        for cycle in 0u64..100 {
+            let base = cycle * 100;
+            for i in 0..100 {
+                map.insert(base + i, base + i);
+            }
+            for i in 0..100 {
+                map.remove(&(base + i));
+            }
+        }
+        assert_eq!(map.len(), 0);
+
+        // Without merge, the pool would grow to ~1250+ buckets
+        // (extendible-hashing-under-churn pathology). With merge, the
+        // live bucket count stays bounded by what's needed for the peak
+        // live size (~100 entries → ~13 buckets at N=8 with full
+        // occupancy, plus some slack).
+        let live_buckets = map.inner.buckets.len() - map.inner.freelist.len();
+        assert!(
+            live_buckets < 64,
+            "expected merge to bound the pool, got {} live buckets",
+            live_buckets,
+        );
+    }
+
+    /// After a merge, lookups for surviving entries must still work and
+    /// every directory slot must point to a bucket whose local_depth is
+    /// consistent with the slot's hash prefix.
+    #[test]
+    fn merge_preserves_directory_invariants() {
+        let mut map = HashMap::new();
+        for i in 0u64..500 {
+            map.insert(i, i);
+        }
+        // Remove half — many of the resulting empty buckets should merge.
+        for i in 0u64..250 {
+            map.remove(&i);
+        }
+        assert_eq!(map.len(), 250);
+
+        // Surviving entries are still findable.
+        for i in 250u64..500 {
+            assert_eq!(map.get(&i), Some(&i), "surviving key {i} lost after merge",);
+        }
+
+        // Directory invariants: every slot points to a valid bucket; bucket's
+        // local_depth matches the slot's hash prefix (slot & local_mask must
+        // equal the bucket's hash_low prefix for every entry in it).
+        let dir_size = map.inner.directory.len();
+        let freelist: std::collections::HashSet<u32> = map.inner.freelist.iter().copied().collect();
+        for slot in 0..dir_size {
+            let bi = map.inner.directory[slot] as usize;
+            assert!(bi < map.inner.buckets.len(), "slot {slot} → bad bi {bi}");
+            assert!(
+                !freelist.contains(&(bi as u32)),
+                "slot {slot} points to freed bucket {bi}",
+            );
+            let bucket = &map.inner.buckets[bi];
+            let local_mask = (1usize << bucket.local_depth) - 1;
+            for i in 0..bucket.len() {
+                let hash_low = bucket.hash_low[i] as usize;
+                assert_eq!(
+                    hash_low & local_mask,
+                    slot & local_mask,
+                    "slot {slot} → bucket {bi} entry {i} hash mismatch",
+                );
+            }
+        }
+    }
+
+    /// Re-inserting keys after a merge cycle must reuse freelist slots
+    /// before extending the pool — otherwise merge would be cosmetic.
+    #[test]
+    fn merge_freelist_reused_by_subsequent_splits() {
+        let mut map = HashMap::new();
+        for i in 0u64..1000 {
+            map.insert(i, i);
+        }
+        let pool_after_insert = map.inner.buckets.len();
+        for i in 0u64..1000 {
+            map.remove(&i);
+        }
+        let freelist_after_remove = map.inner.freelist.len();
+        assert!(
+            freelist_after_remove > 0,
+            "expected merges to have populated the freelist",
+        );
+
+        // Re-insert: future splits should pop from the freelist first.
+        for i in 1000u64..2000 {
+            map.insert(i, i);
+        }
+        let pool_after_reinsert = map.inner.buckets.len();
+        assert!(
+            pool_after_reinsert <= pool_after_insert + 1,
+            "pool grew during reinsert ({} → {}) instead of reusing freelist",
+            pool_after_insert,
+            pool_after_reinsert,
+        );
+        // All reinserts present.
+        for i in 1000u64..2000 {
+            assert_eq!(map[&i], i);
+        }
     }
 }
