@@ -2,6 +2,7 @@
 name = "astenn"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 description = "Extendible hashing HashMap for Rust"
 
 [dev-dependencies]
